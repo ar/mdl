@@ -76,6 +76,9 @@ enum Key {
     Right,
     Home,
     End,
+    /// Nothing typed for a while (the read timed out): the loop can look at
+    /// background work and redraw.
+    Idle,
 }
 
 /// `[<b;x;yM` (press / motion) or `[<b;x;ym` (release) after the ESC: SGR mouse report.
@@ -109,7 +112,7 @@ fn read_byte(stdin: &mut impl Read) -> Option<u8> {
 
 fn read_key(stdin: &mut impl Read) -> Key {
     loop {
-        let Some(b) = read_byte(stdin) else { continue };
+        let Some(b) = read_byte(stdin) else { return Key::Idle };
         return match b {
             b'\r' | b'\n' => Key::Enter,
             0x7f | 0x08 => Key::Backspace,
@@ -198,24 +201,70 @@ fn entry_matches(e: &Entry, q: &str) -> bool {
             .any(|s| !s.is_empty() && s.trim_start_matches('-').starts_with(digits))
 }
 
+/// Fuzzy match, the way `sk` and `fzf` do it: every char of `q` in `s`, in order, case
+/// ignored. The score rewards a match at the start of the name or of a word (after `/`,
+/// `-`, `_`, `.`, a space, or a lower-to-upper step), one right after the previous, and
+/// a short name; a gap between matches costs. None when `q` is not in `s`.
+fn fuzzy_score(s: &str, q: &str) -> Option<i64> {
+    let (sc, qc): (Vec<char>, Vec<char>) = (s.chars().collect(), q.chars().collect());
+    if qc.is_empty() {
+        return Some(-(sc.len() as i64));
+    }
+    let boundary = |i: usize| i == 0 || "/-_. ".contains(sc[i - 1]) || (sc[i - 1].is_lowercase() && sc[i].is_uppercase());
+    // greedy left to right, retrying from each possible start of the first char
+    let mut best: Option<i64> = None;
+    for start in 0..sc.len() {
+        if !sc[start].eq_ignore_ascii_case(&qc[0]) && sc[start].to_lowercase().ne(qc[0].to_lowercase()) {
+            continue;
+        }
+        let (mut score, mut i, mut prev) = (0i64, start, None::<usize>);
+        for c in &qc {
+            let Some(at) = (i..sc.len()).find(|&j| sc[j].to_lowercase().eq(c.to_lowercase())) else { return best };
+            score += 1;
+            if boundary(at) {
+                score += 8;
+            }
+            match prev {
+                Some(p) if p + 1 == at => score += 4,
+                Some(p) => score -= ((at - p - 1) as i64).min(6),
+                None => score -= (at as i64).min(6),
+            }
+            prev = Some(at);
+            i = at + 1;
+        }
+        score -= sc.len() as i64 / 8;
+        best = Some(best.map_or(score, |b| b.max(score)));
+    }
+    best
+}
+
+/// The accounts `q` fuzzy-matches, best first (ties: shorter, then alphabetical), as
+/// names without `.md`.
+fn account_matches(q: &str, accounts: &[String]) -> Vec<String> {
+    let mut hits: Vec<(i64, &String)> = accounts.iter().filter_map(|p| fuzzy_score(p.trim_end_matches(".md"), q.trim()).map(|s| (s, p))).collect();
+    hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(b.1)));
+    hits.into_iter().map(|(_, p)| p.trim_end_matches(".md").to_string()).collect()
+}
+
 /// Map what was typed in the account field to a file from `accounts`: an exact path
-/// (with or without `.md`), else the one file whose name matches, else the one file
-/// whose name starts with it. Several matches are an error listing the candidates.
+/// (with or without `.md`), else the one file whose name matches, else the best fuzzy
+/// match (see `fuzzy_score`). Several files with the same name are an error listing them.
 fn resolve_account(id: &str, accounts: &[String]) -> Result<String, String> {
     let with_md = format!("{id}.md");
     if let Some(p) = accounts.iter().find(|p| **p == with_md || **p == id) {
         return Ok(p.clone());
     }
     let stem = |p: &String| p.rsplit('/').next().unwrap_or(p).trim_end_matches(".md").to_string();
-    for pred in [|s: &str, id: &str| s == id, |s: &str, id: &str| s.starts_with(id)] {
-        let hits: Vec<&String> = accounts.iter().filter(|p| pred(&stem(p), id)).collect();
-        match hits.as_slice() {
-            [] => continue,
-            [one] => return Ok((*one).clone()),
-            many => return Err(format!("ambiguous: {}", many.iter().map(|p| p.trim_end_matches(".md")).collect::<Vec<_>>().join(", "))),
-        }
+    let named: Vec<&String> = accounts.iter().filter(|p| stem(p) == id).collect();
+    match named.as_slice() {
+        [one] => return Ok((*one).clone()),
+        [_, ..] => return Err(format!("ambiguous: {}", named.iter().map(|p| p.trim_end_matches(".md")).collect::<Vec<_>>().join(", "))),
+        [] => {}
     }
-    Err(format!("{id}: no such account"))
+    match account_matches(id, accounts).first() {
+        Some(name) => Ok(format!("{name}.md")),
+        None => Err(format!("{id}: no such account")),
+    }
 }
 
 /// Screen column widths: the date column is wide enough for account names (the account
@@ -327,6 +376,13 @@ fn status_now(s: &str) {
 // "selected": typing replaces it, Enter keeps it. Opening an account with stale
 // balances offers a recalc on the status line first.
 //
+// Account field: what is typed is matched fuzzily against the accounts (`sk` style: the
+// chars in order, word starts and runs scoring higher) and the matches are listed on the
+// status line, the first one highlighted; Tab (or Down) moves the highlight, Shift-Tab
+// (or Up, while no account is open) moves it back, Enter opens the highlighted one; a
+// lone match is completed into the field by Tab. A name that is exactly an account
+// needs no picking: Tab then goes on to the description as usual.
+//
 // Statement: a click on an entry, or Up from the account field, selects it; Up/Down
 // move the selection, Enter edits it in the fields (date in the first one), `n` starts a
 // new entry below it in the fields (same date to begin with; saved, it is selected so
@@ -345,8 +401,9 @@ fn status_now(s: &str) {
 // Ctrl-L closes the account: empty fields, the account list rescanned, cursor in the
 // account field.
 //
-// Git: opening an account first fetches (unless fetched within 15 minutes), Ctrl-S fetches +
-// commits + pushes, and with `mdl.autocommit` every save does.
+// Git: the screen starts a fetch in the background (unless fetched within 15 minutes)
+// and opening an account waits for it, so the account read is the current one; Ctrl-S
+// fetches + commits + pushes, and with `mdl.autocommit` every save does.
 struct Tui {
     h: usize,
     cols: usize,
@@ -394,6 +451,12 @@ struct Tui {
     dir: &'static Path,
     in_repo: bool,
     last_pull: Option<Instant>,
+    /// The pull running in the background, started when the screen opens (and by
+    /// `pull_if_due`); opening an account joins it first.
+    pull_job: Option<std::thread::JoinHandle<Result<(bool, &'static str), String>>>,
+    /// The highlighted account match: for which text in the account field, and its index
+    /// in `account_matches`; any other text means the first match.
+    pick: (String, usize),
 }
 
 impl Tui {
@@ -431,6 +494,8 @@ impl Tui {
             dir,
             in_repo: git::is_repo(dir),
             last_pull: None,
+            pull_job: None,
+            pick: (String::new(), 0),
         }
     }
 
@@ -575,11 +640,20 @@ impl Tui {
             format!("row {}: Enter edit, n new below, Space flag, Ctrl-D delete, Shift-Up/Down move, Esc back", i + 1)
         } else if self.focus == 4 {
             "balance to reach: Enter adds the debit or credit that gets there (empty: a note)".into()
+        } else if let Some(strip) = self.completion_strip() {
+            strip
+        } else if self.pull_job.is_some() {
+            "syncing with the remote in the background…".into()
         } else {
             String::new()
         };
         out += "\x1b[2K";
-        out.extend(status.chars().take(self.cols));
+        // the completion strip carries its own highlight escapes and is already cut to fit
+        if status.contains('\x1b') {
+            out += &status;
+        } else {
+            out.extend(status.chars().take(self.cols));
+        }
         out += "\r\n\x1b[2K│ ";
         let view = |i: usize| {
             let (f, w) = (&self.fields[i], self.w[i]);
@@ -642,6 +716,85 @@ impl Tui {
         self.focus = f;
         self.cur = usize::MAX;
         self.select = f >= 2 && !self.fields[f].is_empty();
+    }
+
+    // ---- account completion ------------------------------------------------
+
+    /// The accounts the account field's text matches, best first; empty when the field
+    /// is empty or in use as a date (an edit).
+    fn completions(&self) -> Vec<String> {
+        let q = self.fields[0].trim();
+        if self.editing.is_some() || q.is_empty() {
+            return vec![];
+        }
+        account_matches(q, &self.accounts)
+    }
+
+    /// The account field's text names an account outright (a path or a file name).
+    fn exact_account(&self) -> bool {
+        let id = self.fields[0].trim();
+        let with_md = format!("{id}.md");
+        self.accounts.iter().any(|p| *p == with_md || *p == id || p.rsplit('/').next().unwrap_or(p).trim_end_matches(".md") == id)
+    }
+
+    /// Index of the highlighted match for the field's current text.
+    fn pick(&self) -> usize {
+        if self.pick.0 == self.fields[0] { self.pick.1 } else { 0 }
+    }
+
+    /// Tab / Shift-Tab in the account field: move the highlight when there is a list to
+    /// move it on; a lone match is completed into the field instead (the next Tab then
+    /// goes on, as for any exact name). False when the key should do what it normally
+    /// does.
+    fn cycle_pick(&mut self, forward: bool) -> bool {
+        if self.focus != 0 || self.editing.is_some() || self.exact_account() {
+            return false;
+        }
+        let names = self.completions();
+        match names.as_slice() {
+            [] => false,
+            [one] => {
+                self.fields[0] = one.clone();
+                self.cur = usize::MAX;
+                true
+            }
+            _ => {
+                let (i, n) = (self.pick(), names.len());
+                self.pick = (self.fields[0].clone(), if forward { (i + 1) % n } else { (i + n - 1) % n });
+                true
+            }
+        }
+    }
+
+    /// The status line while typing an account name: the matches, the picked one in
+    /// reverse video, as many as fit the width. None when there is nothing to show.
+    fn completion_strip(&self) -> Option<String> {
+        if self.focus != 0 || self.editing.is_some() || self.sel.is_some() {
+            return None;
+        }
+        let names = self.completions();
+        if names.is_empty() || (names.len() == 1 && self.exact_account()) {
+            return None;
+        }
+        let (pick, mut used, mut out) = (self.pick(), 0usize, String::new());
+        for (i, name) in names.iter().enumerate() {
+            let w = name.chars().count();
+            if used + w + if used > 0 { 2 } else { 0 } > self.cols.saturating_sub(2) {
+                out += "  …";
+                break;
+            }
+            if used > 0 {
+                out += "  ";
+                used += 2;
+            }
+            if i == pick {
+                out += &format!("\x1b[7m{name}\x1b[0m");
+            } else {
+                out += name;
+            }
+            used += w;
+        }
+        Some(out)
     }
 
     /// Enter (or the second decimal of an amount): next field, or submit. A filled debit
@@ -748,18 +901,42 @@ impl Tui {
         save_commit(path, doc, what)
     }
 
-    /// Fetch before editing, unless the tree was fetched (by anything, in any session)
-    /// less than SYNC_EVERY ago, or this session already tried that recently and failed.
-    fn pull_if_due(&mut self) -> Result<String, String> {
+    /// Start a pull in the background, unless one is running, the tree was fetched (by
+    /// anything, in any session) less than SYNC_EVERY ago, or this session already tried
+    /// recently and failed.
+    fn start_pull(&mut self) {
         const SYNC_EVERY: u64 = 15 * 60;
         let tried = self.last_pull.is_some_and(|t| t.elapsed().as_secs() < SYNC_EVERY);
         let fetched = git::fetched_ago(self.dir).is_some_and(|d| d.as_secs() < SYNC_EVERY);
-        if !self.in_repo || tried || fetched {
-            return Ok(String::new());
+        if !self.in_repo || self.pull_job.is_some() || tried || fetched {
+            return;
         }
-        status_now("syncing…");
         self.last_pull = Some(Instant::now());
-        git::pull(self.dir).map(|(_, n)| n.to_string())
+        let dir = self.dir;
+        self.pull_job = Some(std::thread::spawn(move || git::pull(dir)));
+    }
+
+    /// The background pull has ended (the idle loop asks, to show its note).
+    fn pull_done(&self) -> bool {
+        self.pull_job.as_ref().is_some_and(|j| j.is_finished())
+    }
+
+    /// Wait for the background pull, if any, and return its note.
+    fn finish_pull(&mut self) -> Result<String, String> {
+        let Some(job) = self.pull_job.take() else { return Ok(String::new()) };
+        if !job.is_finished() {
+            status_now("syncing…");
+        }
+        match job.join() {
+            Ok(r) => r.map(|(_, n)| n.to_string()),
+            Err(_) => Err("sync failed".into()),
+        }
+    }
+
+    /// Fetch before editing (see `start_pull` for when), waiting for it to end.
+    fn pull_if_due(&mut self) -> Result<String, String> {
+        self.start_pull();
+        self.finish_pull()
     }
 
     fn open(&mut self) {
@@ -767,7 +944,12 @@ impl Tui {
         let mut opened = self.account.is_some();
         if !id.is_empty() && self.stem() != id {
             opened = false;
-            match resolve_account(&id, &self.accounts) {
+            // the highlighted match when there is a list, else the name as typed
+            let target = match self.completions().get(self.pick()) {
+                Some(name) if !self.exact_account() => Ok(format!("{name}.md")),
+                _ => resolve_account(&id, &self.accounts),
+            };
+            match target {
                 Ok(path) => {
                     let pulled = self.pull_if_due();
                     match load_for_tui(&path) {
@@ -1060,6 +1242,9 @@ impl Tui {
 
     /// One key; false means quit.
     fn handle(&mut self, key: Key) -> bool {
+        if key == Key::Idle {
+            return true;
+        }
         if self.offer_recalc {
             self.accept_recalc(&key);
             return true;
@@ -1082,6 +1267,7 @@ impl Tui {
             }
         }
         let n = self.rows().len();
+        let account_before = self.fields[0].clone();
         match key {
             Key::Esc => {
                 if self.editing.is_some() {
@@ -1138,6 +1324,7 @@ impl Tui {
                     self.set_focus(self.focus.saturating_sub(1));
                 } else if let Some(i) = self.sel {
                     self.select_row(i.saturating_sub(1));
+                } else if self.focus == 0 && self.account.is_none() && self.cycle_pick(false) {
                 } else if self.focus > 0 {
                     self.set_focus(self.focus - 1);
                 } else if n > 0 {
@@ -1153,6 +1340,7 @@ impl Tui {
                     } else {
                         self.sel = None;
                     }
+                } else if self.cycle_pick(true) {
                 } else {
                     self.set_focus((self.focus + 1).min(3));
                 }
@@ -1224,6 +1412,10 @@ impl Tui {
                 (None, Some(i)) => self.start_edit(i),
                 _ => self.enter(),
             },
+            Key::Idle => {}
+        }
+        if self.fields[0] != account_before {
+            self.pick = (String::new(), 0); // new text: the first match is highlighted
         }
         true
     }
@@ -1233,14 +1425,27 @@ pub fn tui() -> Result<(), String> {
     let _raw = Raw::enter().ok_or("not a terminal")?;
     let mut stdin = io::stdin().lock();
     let mut t = Tui::new();
+    t.start_pull();
     print!("\x1b[2J\x1b[3J");
     loop {
         print!("{}", t.draw());
         io::stdout().flush().ok();
         t.msg.clear();
-        let key = read_key(&mut stdin);
-        if !t.handle(key) {
-            break;
+        // wait for a key; while waiting, a finished background pull gets its note shown
+        let key = loop {
+            match read_key(&mut stdin) {
+                Key::Idle if t.pull_done() => {
+                    t.msg = t.finish_pull().unwrap_or_else(|e| e);
+                    break None;
+                }
+                Key::Idle => {}
+                k => break Some(k),
+            }
+        };
+        if let Some(k) = key {
+            if !t.handle(k) {
+                break;
+            }
         }
     }
     Ok(())
@@ -1261,9 +1466,101 @@ mod tests {
         assert_eq!(resolve_account("caja", &a).unwrap(), "caja.md");
         assert_eq!(resolve_account("XYZ", &a).unwrap(), "bank/XYZ.md"); // exact stem beats prefix
         assert_eq!(resolve_account("XYZ2", &a).unwrap(), "bank/XYZ2.md");
-        assert_eq!(resolve_account("AB", &a).unwrap(), "cash/ABC.md"); // unique prefix
-        assert_eq!(resolve_account("XY", &a).unwrap_err(), "ambiguous: bank/XYZ, bank/XYZ2");
+        assert_eq!(resolve_account("AB", &a).unwrap(), "cash/ABC.md"); // prefix
+        assert_eq!(resolve_account("XY", &a).unwrap(), "bank/XYZ.md"); // both match: the shorter
+        assert_eq!(resolve_account("bz2", &a).unwrap(), "bank/XYZ2.md"); // fuzzy: b, z, 2 in order
         assert_eq!(resolve_account("nope", &a).unwrap_err(), "nope: no such account");
+        let twice: Vec<String> = ["a/caja.md", "b/caja.md"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(resolve_account("caja", &twice).unwrap_err(), "ambiguous: a/caja, b/caja");
+    }
+
+    #[test]
+    fn fuzzy_ranking() {
+        let a: Vec<String> = ["cash/ABC.md", "bank/XYZ.md", "bank/XYZ2.md", "caja.md", "notes/acu.md"].iter().map(|s| s.to_string()).collect();
+        assert_eq!(account_matches("ca", &a), ["caja", "cash/ABC"]); // both at the start; the shorter first
+        assert_eq!(account_matches("ab", &a), ["cash/ABC"]); // a word start beats nothing
+        assert_eq!(account_matches("xyz", &a), ["bank/XYZ", "bank/XYZ2"]);
+        assert_eq!(account_matches("z2", &a), ["bank/XYZ2"]);
+        assert_eq!(account_matches("na", &a), ["notes/acu"]); // n, then an a after it: not bank
+        assert_eq!(account_matches("an", &a), ["bank/XYZ", "bank/XYZ2"]); // a run inside a word
+        assert!(account_matches("q", &a).is_empty());
+        assert!(fuzzy_score("cash/ABC", "cA").unwrap() > fuzzy_score("cash/ABC", "sA").unwrap()); // the start of the name scores
+        assert!(fuzzy_score("cash/ABC", "ABC").unwrap() > fuzzy_score("cash/ABC", "AC").unwrap()); // a run beats a gap
+    }
+
+    /// Typing in the account field lists the matches on the status line; Tab moves the
+    /// highlight, Enter opens the highlighted one, and an exact name needs no picking.
+    #[test]
+    fn tui_completes_the_account() {
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.cols = 60;
+        t.accounts = ["bank/main.md", "bank/savings.md", "cash/drawer.md"].iter().map(|s| s.to_string()).collect();
+        let type_all = |t: &mut Tui, s: &str| s.chars().for_each(|c| assert!(t.handle(Key::Char(c))));
+
+        // nothing typed: no strip; "sa" lists savings (a word start) before cash/drawer (s..a inside)
+        assert_eq!(t.completion_strip(), None);
+        type_all(&mut t, "sa");
+        assert_eq!(t.completions(), ["bank/savings", "cash/drawer"]);
+        assert_eq!(t.completion_strip().unwrap(), "\x1b[7mbank/savings\x1b[0m  cash/drawer");
+        assert!(t.draw().contains("\x1b[7mbank/savings\x1b[0m  cash/drawer"));
+
+        // Tab moves the highlight and wraps; Shift-Tab goes back; the field keeps its text
+        assert!(t.handle(Key::Next));
+        assert_eq!((t.pick(), t.focus, t.fields[0].as_str()), (1, 0, "sa"));
+        assert_eq!(t.completion_strip().unwrap(), "bank/savings  \x1b[7mcash/drawer\x1b[0m");
+        t.handle(Key::Next);
+        assert_eq!(t.pick(), 0);
+        t.handle(Key::Prev);
+        assert_eq!(t.pick(), 1);
+        // typing again starts over at the first match; Tab on a lone match completes it
+        type_all(&mut t, "v");
+        assert_eq!((t.pick(), t.completions().len()), (0, 1));
+        t.handle(Key::Next);
+        assert_eq!((t.fields[0].as_str(), t.focus), ("bank/savings", 0));
+        t.handle(Key::Next);
+        assert_eq!(t.focus, 1); // exact now: Tab went on to the description
+        t.set_focus(0);
+        t.fields[0] = "sa".into();
+        t.handle(Key::Next);
+        assert_eq!(t.pick(), 1);
+
+        // a strip too wide for the screen is cut with an ellipsis
+        t.cols = 20;
+        assert_eq!(t.completion_strip().unwrap(), "bank/savings  …");
+        t.cols = 60;
+
+        // an exact name: no strip, and Tab goes on to the description, as before
+        t.fields[0] = "drawer".into();
+        assert_eq!(t.completion_strip(), None);
+        t.handle(Key::Next);
+        assert_eq!(t.focus, 1);
+        t.set_focus(0);
+
+        // no match: Enter says so and nothing opens
+        t.fields[0] = "zzz".into();
+        assert_eq!(t.completion_strip(), None);
+        t.handle(Key::Enter);
+        assert_eq!((t.msg.as_str(), t.account.is_none(), t.fields[0].as_str()), ("zzz: no such account", true, "zzz"));
+
+        // Enter opens the highlighted match: real files this time
+        let dir = std::env::temp_dir().join(format!("mdl-tui-complete-{}", std::process::id()));
+        for d in ["bank", "cash"] {
+            fs::create_dir_all(dir.join(d)).unwrap();
+        }
+        let files = ["bank/main.md", "bank/savings.md", "cash/drawer.md"];
+        for f in files {
+            fs::write(dir.join(f), cash_head(3)).unwrap();
+        }
+        t.accounts = files.iter().map(|f| dir.join(f).to_str().unwrap().to_string()).collect();
+        t.fields[0].clear();
+        type_all(&mut t, "dr"); // the word start in cash/drawer outranks any d..r in the directory names
+        assert!(t.completions()[0].ends_with("cash/drawer"));
+        t.handle(Key::Enter);
+        assert_eq!((t.account.as_ref().map(|(p, _)| p.as_str()), t.focus, t.rows().len()), (Some(dir.join("cash/drawer.md").to_str().unwrap()), 1, 3));
+        assert!(t.fields[0].ends_with("cash/drawer"));
+        assert_eq!(t.completion_strip(), None); // the name is exact: nothing to pick
+        let _ = fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -1430,6 +1727,7 @@ mod tests {
         assert_eq!(read_key(&mut input), Key::PageUp);
         assert_eq!(read_key(&mut input), Key::Click(5, 20));
         assert_eq!(read_key(&mut input), Key::Esc);
+        assert_eq!(read_key(&mut input), Key::Idle); // nothing more to read
     }
 
     #[test]
