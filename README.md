@@ -4,8 +4,15 @@ Ledgers as Markdown tables. Each account is a `.md` file whose first 5-column ta
 `| date | description | debit | credit | balance |`; `mdl` edits it from the terminal,
 checks it, and prints it.
 
+## Install
+
 ```
-cargo install --path .
+cargo install --git https://github.com/ar/mdl
+```
+
+Or from a checkout: `cargo install --path .`
+
+```
 mdl init caja Caja       # a new account, caja.md, with the table template
 mdl caja.md              # show the statement
 mdl caja.md print        # typeset it as caja.pdf
