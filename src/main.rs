@@ -1,13 +1,4 @@
-//! mdl                      interactive data entry over ./**/*.md accounts
-//! mdl --help | --version | <file[.md]> [show] [--json] [period] | print [--graph [balance|debit|credit]...] [period] | lint | balance | recalc [--dry-run] | debit|credit [--date YYYY-MM-DD] <amount|expr> <description...>
-//! mdl <file[.md]> note [--date YYYY-MM-DD] <description...>   (--date before the last row: inserted in date order)
-//! print --graph: the balance charted after the table, stepping through the period; `debit` or `credit`
-//!   charts each entry's amount instead (say, one-entry bill payments), several series in one chart
-//! mdl <file[.md]> edit <row> <date> <debit|-> <credit|-> <description...> | move <row> up|down | flag <row> | delete <row>
-//! mdl balance [--total] <file[.md]>...
-//! period: YYYY-MM [YYYY-MM] | this | last [N]   (months; the statement opens with the balance before them)
-//! mdl fetch | push [message...] | sync [message...]
-//! mdl init <file[.md]> [--lang es|en] [title...]   (a new account, or the table appended to a file without one)
+//! mdl: ledgers as Markdown tables. The commands are in USAGE below (`mdl --help`).
 //!
 //! The ledger is the first 5-column GFM table in the file:
 //! `| date | description | debit | credit | balance |`. Header labels are
@@ -38,21 +29,60 @@ use render::{render, render_json};
 use tui::{scan_accounts, tui};
 
 const USAGE: &str = "\
-usage: mdl                      (interactive, accounts are ./**/*.md)
-       mdl --help | --version | <file[.md]> [show] [--json] [period] | print [--graph [balance|debit|credit]...] [period] | lint | balance | recalc [--dry-run] | debit|credit [--date YYYY-MM-DD] <amount|expr> <description...>
-       mdl <file[.md]> note [--date YYYY-MM-DD] <description...>                     (a dated remark; the balance stays)
-       --date before the last row: the entry is inserted in date order, after the rows on that day
-       print --graph: the balance charted after the table, stepping through the period
-       --graph debit | credit: each entry's amount instead (say, one-entry bill payments); several series in one chart
-       mdl <file[.md]> edit <row> <date> <debit|-> <credit|-> <description...> | move <row> up|down | flag <row> | delete <row>
-       mdl balance [--total] <file[.md]>...
-       mdl fetch | push [message...] | sync [message...]
-       mdl init <file[.md]> [--lang es|en] [title...]      (a new account, or the table appended to a file without one)
-       period: YYYY-MM [YYYY-MM] | this | last [N]   (months; the statement opens with the balance before them)
+usage: mdl [<file>[.md]] [<command> [args...]]
+
+  mdl                                  interactive screen over ./**/*.md
+  mdl init <file> [--lang es|en] [title...]
+                                       a new account; a file without a table
+                                       gets one appended
+  mdl --help | --version
+
+Read
+  mdl <file> [show] [--json] [period]  the statement (the default command)
+  mdl <file> print [--graph [balance|debit|credit]...] [period]
+                                       typeset to <file>.pdf; --graph charts
+                                       the balance, or each entry's amounts
+  mdl <file> lint                      check dates, balances and #expressions
+  mdl <file> balance                   the closing balance
+  mdl balance [--total] <file>...      several accounts, and their sum
+
+Write
+  mdl <file> debit  [--date D] <amount> <description...>
+  mdl <file> credit [--date D] <amount> <description...>
+  mdl <file> note   [--date D] <description...>
+                                       a dated remark; the balance stays
+  mdl <file> edit <row> <date> <debit|-> <credit|-> <description...>
+  mdl <file> move <row> up|down        swap with the row above or below
+  mdl <file> flag <row>                toggle bold
+  mdl <file> delete <row>
+  mdl <file> recalc [--dry-run]        recompute the balances; --dry-run
+                                       only reports the stale ones
+
+Git (the current directory is the account tree)
+  mdl fetch                            bring the tree up to date; no commit
+  mdl push [message...]                commit everything pending and push
+  mdl sync [message...]                fetch, then push
+  git config mdl.autocommit true       every save commits and pushes
+
+period      YYYY-MM [YYYY-MM] | this | last [N]: months; the statement opens
+            with the balance before them
+--date D    D is YYYY-MM-DD, today by default; a date before the last row
+            inserts the entry in date order, after the rows on that day
+amount      1234.50, or a computation: 100+200+50, 1000*40.50
+#expr       a description may start with one (#1000*40.50 exchange): its
+            value is the row's amount, negative for a credit; lint checks
+            it, and the interactive screen fills the amount from it
 ";
 
 fn usage() -> ! {
     eprint!("{USAGE}");
+    process::exit(2)
+}
+
+/// A command line that does not parse: one line saying what is missing, and where the
+/// full usage is. Exit status 2, like `usage`.
+fn bad(what: &str) -> ! {
+    eprintln!("mdl: {what} (see mdl --help)");
     process::exit(2)
 }
 
@@ -66,11 +96,11 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
     let mut it = args.iter();
     while let Some(a) = it.next() {
         match a.as_str() {
-            "--lang" => lang = it.next().cloned().unwrap_or_else(|| usage()),
+            "--lang" => lang = it.next().cloned().unwrap_or_else(|| bad("init: --lang needs es or en")),
             _ => words.push(a.clone()),
         }
     }
-    let [file, title @ ..] = &words[..] else { usage() };
+    let [file, title @ ..] = &words[..] else { bad("init needs a file name") };
     let file = if file.ends_with(".md") { file.clone() } else { format!("{file}.md") };
     let stem = Path::new(&file).file_stem().map_or(file.clone(), |s| s.to_string_lossy().into_owned());
     let title = if title.is_empty() { stem.clone() } else { title.join(" ") };
@@ -213,7 +243,7 @@ fn run() -> Result<(), String> {
             r => (false, r),
         };
         if files.is_empty() {
-            usage()
+            bad("balance needs at least one file")
         }
         let mut total = 0;
         for f in files {
@@ -299,7 +329,7 @@ fn run() -> Result<(), String> {
                 let diffs = recalc_diff(&doc.rows);
                 return if diffs.is_empty() { Ok(()) } else { Err(diffs.join("\n")) };
             }
-            _ => usage(),
+            _ => bad("recalc takes --dry-run and nothing else"),
         },
         "debit" | "credit" | "note" => {
             let (date, rest) = match rest {
@@ -310,10 +340,10 @@ fn run() -> Result<(), String> {
                 ("note", desc) => (0, 0, desc),
                 ("debit", [amount, desc @ ..]) => (amount_arg(amount)?, 0, desc),
                 ("credit", [amount, desc @ ..]) => (0, amount_arg(amount)?, desc),
-                _ => usage(),
+                _ => bad(&format!("{cmd} needs an amount and a description")),
             };
             if desc.is_empty() {
-                usage()
+                bad(&format!("{cmd} needs a description"))
             }
             let i = add_entry(&mut doc.rows, date, debit, credit, desc.join(" "))?;
             if i + 1 < doc.rows.len() {
@@ -322,20 +352,20 @@ fn run() -> Result<(), String> {
             what = entry_what(debit, credit, &desc.join(" "));
         }
         "edit" => {
-            let [n, date, debit, credit, desc @ ..] = rest else { usage() };
+            let [n, date, debit, credit, desc @ ..] = rest else { bad("edit needs <row> <date> <debit|-> <credit|-> <description...>") };
             if desc.is_empty() {
-                usage()
+                bad("edit needs a description")
             }
             let i = row_index(n, doc.rows.len())?;
             edit_entry(&mut doc.rows, i, date.clone(), amount_arg(debit)?, amount_arg(credit)?, desc.join(" "))?;
             what = format!("edit row {}: {}", i + 1, desc.join(" "));
         }
         "move" => {
-            let [n, dir] = rest else { usage() };
+            let [n, dir] = rest else { bad("move needs <row> up|down") };
             let up = match dir.as_str() {
                 "up" => true,
                 "down" => false,
-                _ => usage(),
+                _ => bad(&format!("move: `{dir}` is not up or down")),
             };
             let i = row_index(n, doc.rows.len())?;
             let j = move_entry(&mut doc.rows, i, up)?;
@@ -343,18 +373,18 @@ fn run() -> Result<(), String> {
             what = format!("move row {} {dir}", i + 1);
         }
         "flag" => {
-            let [n] = rest else { usage() };
+            let [n] = rest else { bad("flag needs a row number") };
             let i = row_index(n, doc.rows.len())?;
             doc.rows[i].bold = !doc.rows[i].bold;
             what = format!("{} row {}", if doc.rows[i].bold { "flag" } else { "unflag" }, i + 1);
         }
         "delete" => {
-            let [n] = rest else { usage() };
+            let [n] = rest else { bad("delete needs a row number") };
             let i = row_index(n, doc.rows.len())?;
             let e = delete_entry(&mut doc.rows, i)?;
             what = format!("delete row {}: {}", i + 1, e.desc);
         }
-        _ => usage(),
+        _ => bad(&format!("`{cmd}` is not a command")),
     }
     let note = save_commit(file, &doc, &what)?;
     if !note.is_empty() && note != "pushed" {
@@ -477,7 +507,7 @@ mod tests {
         assert!(err.starts_with("merge conflicts;") && err.ends_with("caja.md"), "{err}");
         assert!(load(a.join("caja.md").to_str().unwrap()).is_err()); // markers trip the parser
         sh(&a, &["merge", "--abort"]);
-        assert!(git::autocommit(&a) == false);
+        assert!(!git::autocommit(&a));
         sh(&a, &["config", "mdl.autocommit", "true"]);
         assert!(git::autocommit(&a));
         let _ = fs::remove_dir_all(&base);

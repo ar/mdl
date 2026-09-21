@@ -69,6 +69,34 @@ A `--date` before the last row, on `note`, `debit` or `credit`, inserts the entr
 date order, after the rows already on that day, and recomputes the balances from
 there; `mdl` says which row it became.
 
+## Computed amounts
+
+An amount on the command line may be a computation: `+`, `-`, `*`, `/`, parentheses
+and decimals, rounded to cents.
+
+```
+mdl cash.md debit 100+200+50 Three invoices
+mdl cash.md credit 1000*40.50 Dollars bought
+```
+
+A description may carry its own computation: one that starts with `#` followed by an
+expression with at least one operator, such as `#1000*40.50 currency exchange` or
+`#100+200+50 sundries`. Its value is the row's effect on the balance: positive is a
+debit, negative (`#-1000*40.50 USD sale`) a credit. The expression stays in the
+description, so the row shows where its amount came from. `lint` checks that each
+such description agrees with its row, and in the interactive screen Enter from the
+description fills the amount field with the value, selected, ready to accept with
+another Enter or to type over. Without the `#` a description is prose however it
+looks (`2-3 people`, `1000*40.50 exchange`), and so is `#123 invoice`: a `#` with just
+a number.
+
+```
+mdl cash.md debit 40500 '#1000*40.50 currency exchange'   # lint: agrees
+mdl cash.md debit 40000 '#1000*40.50 currency exchange'   # lint: description computes 40500.00 but the row is 40000.00
+```
+
+On the command line the `#` needs quoting, or the shell reads it as a comment.
+
 ## Printing to PDF
 
 `mdl <file> print [--graph [balance|debit|credit]...] [period]` typesets the statement with [Typst](https://typst.app),

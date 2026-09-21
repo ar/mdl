@@ -119,12 +119,14 @@ fn tick_step(range: i64) -> i64 {
 /// value of each series labelled in its colour. The geometry is computed here in day
 /// offsets and cents; the Typst only scales and draws.
 fn render_chart(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> String {
+    /// One charted series: its header column, its colour, and the value of each row it plots.
+    type Series<'a> = (usize, &'static str, Vec<(&'a Entry, i64)>);
     let (first, last) = (&doc.rows[0], &doc.rows[doc.rows.len() - 1]);
     // (header column, colour, the rows' values) per series, skipping empty ones
-    let pick = |col: usize, color: &'static str, f: fn(&Entry) -> i64| -> (usize, &str, Vec<(&Entry, i64)>) {
+    let pick = |col: usize, color: &'static str, f: fn(&Entry) -> i64| -> Series {
         (col, color, doc.rows.iter().map(|e| (e, f(e))).filter(|(_, v)| col == 4 || *v != 0).collect())
     };
-    let series: Vec<(usize, &str, Vec<(&Entry, i64)>)> = series
+    let series: Vec<Series> = series
         .iter()
         .filter_map(|s| match s.as_str() {
             "balance" => Some(pick(4, "#2a6fdb", |e| e.balance)),
@@ -266,19 +268,19 @@ mod tests {
 
     #[test]
     fn print_typesets_the_statement() {
-        let mut doc = load("caja.md").unwrap();
-        doc.rows[1].desc = "Venta \"al\" contado \\ resto".into();
+        let mut doc = load("cash.md").unwrap();
+        doc.rows[1].desc = "Sale \"over\" the counter \\ rest".into();
         doc.rows[1].bold = true;
-        let t = render_typst(&doc, "caja.md", &None, &[]);
+        let t = render_typst(&doc, "cash.md", &None, &[]);
         assert!(t.contains("#h(1fr) #datetime.today()"));
         let p = Some(("2026-08".to_string(), "2026-09".to_string()));
-        assert!(render_typst(&doc, "caja.md", &p, &[]).contains("#h(1fr) #\"2026-08 – 2026-09\"\n"));
-        assert!(t.contains("= #\"Caja\"\n"));
-        assert!(t.contains("#\"Libro mayor de la cuenta Caja. Saldo = Σ debe − Σ haber.\"\n\n"));
-        assert!(t.contains("#\"Notas libres debajo de la tabla quedan intactas.\"\n\n"));
-        assert!(t.contains("strong(\"Venta \\\"al\\\" contado \\\\ resto\")"));
-        assert!(t.contains("  \"2026-09-05\", \"Pago proveedor\", \"\", \"81.00\", \"69.00\",\n"));
-        assert!(t.contains("strong(\"\"), strong(\"\"), strong(\"175.50\"), strong(\"93.00\"), strong(\"\"),\n"));
+        assert!(render_typst(&doc, "cash.md", &p, &[]).contains("#h(1fr) #\"2026-08 – 2026-09\"\n"));
+        assert!(t.contains("= #\"Cash\"\n"));
+        assert!(t.contains("#\"Ledger of the Cash account. Balance = Σ debit − Σ credit.\"\n\n"));
+        assert!(t.contains("#\"Free notes below the table are left untouched.\"\n\n"));
+        assert!(t.contains("strong(\"Sale \\\"over\\\" the counter \\\\ rest\")"));
+        assert!(t.contains("  \"2026-09-05\", \"Supplier payment\", \"\", \"81.00\", \"277.00\",\n"));
+        assert!(t.contains("strong(\"\"), strong(\"\"), strong(\"1510.50\"), strong(\"1178.85\"), strong(\"\"),\n"));
         assert!(!t.contains("balance-chart"));
         typst_compiles(&t);
     }
@@ -302,62 +304,66 @@ mod tests {
         assert_eq!((tick_step(15000), tick_step(150), tick_step(1), tick_step(99999)), (5000, 50, 1, 50000));
 
         // the whole ledger: day offsets from the first row, the y ticks in whole units
-        let doc = load("caja.md").unwrap();
-        let t = render_typst(&doc, "caja.md", &None, &["balance".to_string()]);
-        assert!(t.contains("#block(breakable: false, [\n  #text(9pt, fill: luma(40%), text(fill: rgb(\"#2a6fdb\"), \"Saldo\"))\n"));
-        assert!(t.contains("#ledger-chart(30, 0, 15000, ((0, \"0\"), (5000, \"50\"), (10000, \"100\"), (15000, \"150\"),), ((0, \"2026-09\"),), ((((0, 0), (2, 15000), (4, 6900), (16, 9450), (29, 8250),), \"82.50\", rgb(\"#2a6fdb\")),))\n"));
+        let doc = load("cash.md").unwrap();
+        let t = render_typst(&doc, "cash.md", &None, &["balance".to_string()]);
+        assert!(t.contains("#block(breakable: false, [\n  #text(9pt, fill: luma(40%), text(fill: rgb(\"#2a6fdb\"), \"Balance\"))\n"));
+        assert!(t.contains("#ledger-chart(30, 0, 150000, ((0, \"0\"), (50000, \"500\"), (100000, \"1000\"), (150000, \"1500\"),), ((0, \"2026-09\"),), ((((0, 0), (1, 15000), (2, 13800), (3, 35800), (4, 27700), (7, 30250), (8, 26760), (9, 36260), (10, 34460), (11, 29960), (14, 79960), (15, 73730), (16, 91730), (17, 90755), (18, 90755), (21, 111755), (22, 104255), (23, 103605), (24, 116605), (25, 36605), (28, 34365), (29, 33165),), \"331.65\", rgb(\"#2a6fdb\")),))\n"));
         assert!(t.find("ledger-chart").unwrap() > t.find("table.hline(stroke: 0.8pt),\n)").unwrap());
-        assert!(t.find("#ledger-chart").unwrap() < t.find("Notas libres").unwrap());
+        assert!(t.find("#ledger-chart").unwrap() < t.find("Free notes").unwrap());
         typst_compiles(&t);
         // a period: the axis spans its months, the opening row at day 0
         let p = Some(("2026-08".to_string(), "2026-09".to_string()));
-        let t = render_typst(&scoped(load("caja.md").unwrap(), &p), "caja.md", &p, &["balance".to_string()]);
-        assert!(t.contains("#ledger-chart(61, 0, 15000, ((0, \"0\"), (5000, \"50\"), (10000, \"100\"), (15000, \"150\"),), ((0, \"2026-08\"), (31, \"2026-09\"),), ((((0, 0), (31, 0), (33, 15000),"));
+        let t = render_typst(&scoped(load("cash.md").unwrap(), &p), "cash.md", &p, &["balance".to_string()]);
+        assert!(t.contains("#ledger-chart(61, 0, 150000, ((0, \"0\"), (50000, \"500\"), (100000, \"1000\"), (150000, \"1500\"),), ((0, \"2026-08\"), (31, \"2026-09\"),), ((((0, 0), (31, 0), (32, 15000), (33, 13800),"));
         typst_compiles(&t);
         // negative balances put the zero line inside; small ones keep their cents
-        let mut doc = load("caja.md").unwrap();
+        let mut doc = load("cash.md").unwrap();
         for e in &mut doc.rows {
             e.balance = -e.balance / 3;
         }
-        let t = render_typst(&doc, "caja.md", &None, &["balance".to_string()]);
-        assert!(t.contains("#ledger-chart(30, -6000, 0, ((-6000, \"-60\"), (-4000, \"-40\"), (-2000, \"-20\"), (0, \"0\"),),"));
+        let t = render_typst(&doc, "cash.md", &None, &["balance".to_string()]);
+        assert!(t.contains("#ledger-chart(30, -40000, 0, ((-40000, \"-400\"), (-30000, \"-300\"), (-20000, \"-200\"), (-10000, \"-100\"), (0, \"0\"),),"));
         for e in &mut doc.rows {
             e.balance = -e.balance / 100;
         }
-        let t = render_typst(&doc, "caja.md", &None, &["balance".to_string()]);
-        assert!(t.contains("#ledger-chart(30, 0, 60, ((0, \"0.00\"), (20, \"0.20\"), (40, \"0.40\"), (60, \"0.60\"),),"));
+        let t = render_typst(&doc, "cash.md", &None, &["balance".to_string()]);
+        assert!(t.contains("#ledger-chart(30, 0, 400, ((0, \"0\"), (100, \"1\"), (200, \"2\"), (300, \"3\"), (400, \"4\"),),"));
+        assert!(t.contains("(29, 110),), \"1.10\", rgb(\"#2a6fdb\")),))"));
         typst_compiles(&t);
         // long spans: quarters, then years, as many as the page fits
-        let mut doc = load("caja.md").unwrap();
+        let mut doc = load("cash.md").unwrap();
         doc.rows[0].date = "2025-01-05".into();
-        let t = render_typst(&doc, "caja.md", &None, &["balance".to_string()]);
+        let t = render_typst(&doc, "cash.md", &None, &["balance".to_string()]);
         assert!(t.contains(", ((0, \"2025-01\"), (90, \"2025-04\"), (181, \"2025-07\"), (273, \"2025-10\"), (365, \"2026-01\"), (455, \"2026-04\"), (546, \"2026-07\"),), ((((4, 0),"));
         doc.rows[0].date = "2010-01-05".into();
-        let t = render_typst(&doc, "caja.md", &None, &["balance".to_string()]);
+        let t = render_typst(&doc, "cash.md", &None, &["balance".to_string()]);
         assert!(t.contains(", ((0, \"2010\"), (365, \"2011\"), (730, \"2012\"), (1096, \"2013\"),") && t.contains("(5844, \"2026\"),), ((((4, 0),"));
         doc.rows[0].date = "1990-01-05".into();
-        let t = render_typst(&doc, "caja.md", &None, &["balance".to_string()]);
+        let t = render_typst(&doc, "cash.md", &None, &["balance".to_string()]);
         assert!(t.contains(", ((0, \"1990\"), (1826, \"1995\"),") && !t.contains("\"1991\""));
         typst_compiles(&t);
         // one row: its month, the y range at least a step
         doc.rows.truncate(1);
         doc.rows[0].date = "2026-09-01".into();
-        let t = render_typst(&doc, "caja.md", &None, &["balance".to_string()]);
+        let t = render_typst(&doc, "cash.md", &None, &["balance".to_string()]);
         assert!(t.contains("#ledger-chart(30, 0, 1, ((0, \"0.00\"), (1, \"0.01\"),), ((0, \"2026-09\"),), ((((0, 0),), \"0.00\", rgb(\"#2a6fdb\")),))"));
         typst_compiles(&t);
         // debit and credit: each entry's amount, rows without one skipped, both in one
         // chart under a two-colour caption; an unknown or empty series draws nothing
-        let doc = load("caja.md").unwrap();
+        let doc = load("cash.md").unwrap();
         let s = |w: &[&str]| -> Vec<String> { w.iter().map(|x| x.to_string()).collect() };
-        let t = render_typst(&doc, "caja.md", &None, &s(&["debit", "credit"]));
-        assert!(t.contains("#block(breakable: false, [\n  #text(9pt, fill: luma(40%), text(fill: rgb(\"#2a9d5c\"), \"Debe\") + \" / \" + text(fill: rgb(\"#d1495b\"), \"Haber\"))\n"));
-        assert!(t.contains("#ledger-chart(30, 0, 15000, ((0, \"0\"), (5000, \"50\"), (10000, \"100\"), (15000, \"150\"),), ((0, \"2026-09\"),), ((((2, 15000), (16, 2550),), \"25.50\", rgb(\"#2a9d5c\")), (((4, 8100), (29, 1200),), \"12.00\", rgb(\"#d1495b\")),))\n"));
+        let t = render_typst(&doc, "cash.md", &None, &s(&["debit", "credit"]));
+        assert!(t.contains("#block(breakable: false, [\n  #text(9pt, fill: luma(40%), text(fill: rgb(\"#2a9d5c\"), \"Debit\") + \" / \" + text(fill: rgb(\"#d1495b\"), \"Credit\"))\n"));
+        let debits = "(((1, 15000), (3, 22000), (7, 2550), (9, 9500), (14, 50000), (16, 18000), (21, 21000), (24, 13000),), \"130.00\", rgb(\"#2a9d5c\"))";
+        let credits = "(((2, 1200), (4, 8100), (8, 3490), (10, 1800), (11, 4500), (15, 6230), (17, 975), (22, 7500), (23, 650), (25, 80000), (28, 2240), (29, 1200),), \"12.00\", rgb(\"#d1495b\"))";
+        assert!(t.contains(&format!("#ledger-chart(30, 0, 80000, ((0, \"0\"), (20000, \"200\"), (40000, \"400\"), (60000, \"600\"), (80000, \"800\"),), ((0, \"2026-09\"),), ({debits}, {credits},))\n")));
         typst_compiles(&t);
-        let t = render_typst(&doc, "caja.md", &None, &s(&["credit"]));
-        assert!(t.contains("#ledger-chart(30, 0, 10000, ((0, \"0\"), (5000, \"50\"), (10000, \"100\"),), ((0, \"2026-09\"),), ((((4, 8100), (29, 1200),), \"12.00\", rgb(\"#d1495b\")),))\n"));
-        let mut doc = load("caja.md").unwrap();
+        let t = render_typst(&doc, "cash.md", &None, &s(&["credit"]));
+        assert!(t.contains("text(fill: rgb(\"#d1495b\"), \"Credit\"))\n"));
+        assert!(t.contains(&format!("#ledger-chart(30, 0, 80000, ((0, \"0\"), (20000, \"200\"), (40000, \"400\"), (60000, \"600\"), (80000, \"800\"),), ((0, \"2026-09\"),), ({credits},))\n")));
+        let mut doc = load("cash.md").unwrap();
         doc.rows.truncate(1);
-        assert!(!render_typst(&doc, "caja.md", &None, &s(&["debit", "bogus"])).contains("ledger-chart"));
-        assert!(!render_typst(&doc, "caja.md", &None, &[]).contains("ledger-chart"));
+        assert!(!render_typst(&doc, "cash.md", &None, &s(&["debit", "bogus"])).contains("ledger-chart"));
+        assert!(!render_typst(&doc, "cash.md", &None, &[]).contains("ledger-chart"));
     }
 }

@@ -1249,7 +1249,7 @@ pub fn tui() -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ledger::lint;
+    use crate::ledger::{cash_head, lint};
     use crate::render::{render, render_cols, wrap_words};
 
     #[test]
@@ -1278,20 +1278,20 @@ mod tests {
         assert!(parse_mouse(b"[A").is_none());
     }
 
-    /// The TUI state machine, headless, on a scratch copy of caja.md.
+    /// The TUI state machine, headless, on a scratch copy of the first rows of cash.md.
     #[test]
     fn tui_select_edit_delete() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-test-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::copy("caja.md", &file).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
         t.h = 24;
         t.view = 22;
         t.account = Some((path.clone(), load(&path).unwrap()));
-        t.fields[0] = "caja".into();
+        t.fields[0] = "cash".into();
         t.rebuild();
         assert_eq!(t.rows().len(), 5);
         assert_eq!(t.lines.len(), 1 + 3 + 5 + 3); // title, top border, header, separator, rows, separator, totals, bottom border
@@ -1302,7 +1302,7 @@ mod tests {
         assert_eq!(t.sel, Some(4));
         t.handle(Key::Prev);
         assert_eq!(t.sel, Some(3));
-        assert!(t.draw().contains("\x1b[7m│ 2026-09-17 │ Propina recibida"));
+        assert!(t.draw().contains("\x1b[7m│ 2026-09-04 │ Counter sale"));
         assert!(t.draw().contains("row 4: Enter edit"));
         t.handle(Key::Next);
         t.handle(Key::Next);
@@ -1319,20 +1319,20 @@ mod tests {
         // Enter edits: date lands in the first field; Esc cancels and restores the account name
         t.handle(Key::Enter);
         assert_eq!((t.editing, t.focus), (Some(2), 1));
-        assert_eq!(t.fields, ["2026-09-05", "Pago proveedor", "", "81.00", ""]);
+        assert_eq!(t.fields, ["2026-09-03", "Coffee", "", "12.00", ""]);
         t.handle(Key::Esc);
         let stem = path.trim_end_matches(".md").to_string();
         assert_eq!((t.editing, t.sel, t.fields[0].as_str()), (None, Some(2), stem.as_str()));
 
         // edit for real: change the credit, submit from the last field
         t.handle(Key::Enter);
-        t.fields[3] = "80.00".into();
+        t.fields[3] = "11.00".into();
         t.focus = 3;
         t.handle(Key::Enter);
         assert_eq!(t.editing, None);
         assert_eq!(t.msg, "row 3 updated");
-        assert_eq!(t.rows()[4].balance, 8350);
-        assert!(fs::read_to_string(&file).unwrap().contains("|  83.50 |"));
+        assert_eq!(t.rows()[4].balance, 27800);
+        assert!(fs::read_to_string(&file).unwrap().contains("|  278.00 |"));
 
         // a date out of order is refused and stays in edit
         t.handle(Key::Enter);
@@ -1340,14 +1340,14 @@ mod tests {
         t.focus = 3;
         t.handle(Key::Enter);
         assert_eq!(t.editing, Some(2));
-        assert_eq!(t.msg, "date 2026-09-20 is after row 4 (2026-09-17)");
+        assert_eq!(t.msg, "date 2026-09-20 is after row 4 (2026-09-04)");
         t.handle(Key::Esc);
 
         // delete at once; the selection stays on the same row number
         t.handle(Key::Delete);
         assert_eq!(t.msg, "row 3 deleted");
         assert_eq!((t.rows().len(), t.sel), (4, Some(2)));
-        assert!(!fs::read_to_string(&file).unwrap().contains("Pago proveedor"));
+        assert!(!fs::read_to_string(&file).unwrap().contains("Coffee"));
         // typing leaves statement mode and goes to the focused field
         t.handle(Key::Char('x'));
         assert_eq!((t.sel, t.fields[0].as_str()), (None, format!("{stem}x").as_str()));
@@ -1398,18 +1398,18 @@ mod tests {
     fn tui_moves_the_selection() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-move-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::copy("caja.md", &file).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
         t.account = Some((path.clone(), load(&path).unwrap()));
         t.rebuild();
-        t.handle(Key::Prev); // Café, row 5
+        t.handle(Key::Prev); // Supplier payment, row 5
         t.handle(Key::MoveUp);
-        assert_eq!(t.msg, "row 5 moved up to row 4, now 2026-09-17");
+        assert_eq!(t.msg, "row 5 moved up to row 4, now 2026-09-04");
         assert_eq!(t.sel, Some(3));
-        assert!(fs::read_to_string(&file).unwrap().contains("| 2026-09-17 | Café"));
+        assert!(fs::read_to_string(&file).unwrap().contains("| 2026-09-04 | Supplier payment"));
         t.handle(Key::MoveDown); // same day both ways now: no date note
         assert_eq!(t.msg, "row 4 moved down to row 5");
         t.handle(Key::MoveDown);
@@ -1436,8 +1436,8 @@ mod tests {
     fn tui_drags_an_entry() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-drag-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::copy("caja.md", &file).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
@@ -1448,20 +1448,20 @@ mod tests {
         // 10 blank rows, title 11, blank 12, header 13, separator 14, entries 15..19, totals below
         assert_eq!(t.entry_at(14), None);
         assert_eq!(t.entry_at(19), Some(4));
-        t.handle(Key::Click(5, 19)); // press on Café
-        assert_eq!(t.drag.as_ref(), Some(&(4, "2026-09-30".to_string())));
+        t.handle(Key::Click(5, 19)); // press on Supplier payment
+        assert_eq!(t.drag.as_ref(), Some(&(4, "2026-09-05".to_string())));
         t.handle(Key::Drag(5, 18));
         t.handle(Key::Drag(5, 17)); // up to row 3
         assert_eq!(t.sel, Some(2));
-        assert_eq!(t.rows()[2].desc, "Café");
-        assert_eq!(t.rows()[2].date, "2026-09-05");
-        assert!(fs::read_to_string(&file).unwrap().contains("| 2026-09-30 | Café")); // not saved yet
+        assert_eq!(t.rows()[2].desc, "Supplier payment");
+        assert_eq!(t.rows()[2].date, "2026-09-03");
+        assert!(fs::read_to_string(&file).unwrap().contains("| 2026-09-05 | Supplier payment")); // not saved yet
         t.handle(Key::Drag(5, 13)); // the header: ignored
         assert_eq!(t.sel, Some(2));
         t.handle(Key::Release(5, 17));
-        assert_eq!(t.msg, "row 5 moved to row 3, now 2026-09-05");
+        assert_eq!(t.msg, "row 5 moved to row 3, now 2026-09-03");
         assert!(t.drag.is_none());
-        assert!(fs::read_to_string(&file).unwrap().contains("| 2026-09-05 | Café"));
+        assert!(fs::read_to_string(&file).unwrap().contains("| 2026-09-03 | Supplier payment"));
         assert!(lint(t.rows()).is_empty());
         // press and release in place: a plain selection, nothing written
         let before = fs::metadata(&file).unwrap().modified().unwrap();
@@ -1474,10 +1474,10 @@ mod tests {
         let disk = fs::read_to_string(&file).unwrap();
         t.handle(Key::Click(5, 15));
         t.handle(Key::Drag(5, 16));
-        assert_eq!(t.rows()[1].desc, "Saldo inicial");
+        assert_eq!(t.rows()[1].desc, "Opening balance");
         t.handle(Key::Esc);
         assert_eq!((t.msg.as_str(), t.sel, t.drag.is_none()), ("drag cancelled", Some(0), true));
-        assert_eq!(t.rows()[0].desc, "Saldo inicial");
+        assert_eq!(t.rows()[0].desc, "Opening balance");
         assert_eq!(fs::read_to_string(&file).unwrap(), disk);
         // Esc on a drag that has not moved is an ordinary Esc: back to the form
         t.handle(Key::Click(5, 15));
@@ -1496,20 +1496,20 @@ mod tests {
     fn tui_space_flags_a_row() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-flag-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::copy("caja.md", &file).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
         t.account = Some((path.clone(), load(&path).unwrap()));
         t.rebuild();
-        assert_eq!(t.lines[0].0, "Caja"); // title without the `# `
+        assert_eq!(t.lines[0].0, "Cash"); // title without the `# `
         t.handle(Key::Prev);
         t.handle(Key::Char(' '));
         assert_eq!(t.msg, "row 5 flagged");
         assert!(t.rows()[4].bold);
-        assert!(t.draw().contains("\x1b[1m\x1b[7m│ 2026-09-30 │ Café"));
-        assert!(fs::read_to_string(&file).unwrap().contains("| **Café**"));
+        assert!(t.draw().contains("\x1b[1m\x1b[7m│ 2026-09-05 │ Supplier payment"));
+        assert!(fs::read_to_string(&file).unwrap().contains("| **Supplier payment**"));
         // editing keeps the flag; a second Space clears it
         t.handle(Key::Enter);
         t.focus = 3;
@@ -1529,8 +1529,8 @@ mod tests {
     fn tui_enter_with_no_amount_adds_a_note() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-note-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::write(&file, fs::read_to_string("caja.md").unwrap().replace("2026-09-30", "2026-09-17")).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
@@ -1540,16 +1540,16 @@ mod tests {
         t.rebuild();
         let stem = path.trim_end_matches(".md").to_string();
         // Enter through the empty debit, credit and balance: a note, the balance unchanged
-        t.fields = [stem.clone(), "Arqueo: coincide con el banco".into(), String::new(), String::new(), String::new()];
+        t.fields = [stem.clone(), "Reconciled with the bank".into(), String::new(), String::new(), String::new()];
         t.focus = 2;
         t.handle(Key::Enter);
         t.handle(Key::Enter);
         assert_eq!(t.focus, 4);
         t.handle(Key::Enter);
         let e = t.rows().last().unwrap();
-        assert_eq!((t.rows().len(), e.debit, e.credit, e.balance, e.desc.as_str()), (6, 0, 0, 8250, "Arqueo: coincide con el banco"));
+        assert_eq!((t.rows().len(), e.debit, e.credit, e.balance, e.desc.as_str()), (6, 0, 0, 27700, "Reconciled with the bank"));
         assert!(lint(t.rows()).is_empty());
-        assert!(fs::read_to_string(&path).unwrap().contains("| Arqueo: coincide con el banco |        |       |  82.50 |"));
+        assert!(fs::read_to_string(&path).unwrap().contains("| Reconciled with the bank |        |        |  277.00 |"));
         // editing it into a payment, and an insert of a note below row 2
         t.sel = Some(5);
         t.handle(Key::Enter);
@@ -1557,7 +1557,7 @@ mod tests {
         t.fields[2] = "10".into();
         t.focus = 2;
         t.handle(Key::Enter);
-        assert_eq!((t.rows()[5].debit, t.rows()[5].balance, t.editing), (1000, 9250, None));
+        assert_eq!((t.rows()[5].debit, t.rows()[5].balance, t.editing), (1000, 28700, None));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -1581,8 +1581,8 @@ mod tests {
     fn tui_balance_to_reach() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-balance-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::write(&file, fs::read_to_string("caja.md").unwrap().replace("2026-09-30", "2026-09-17")).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
@@ -1592,10 +1592,10 @@ mod tests {
         t.rebuild();
         let stem = path.trim_end_matches(".md").to_string();
         let type_all = |t: &mut Tui, s: &str| s.chars().for_each(|c| assert!(t.handle(Key::Char(c))));
-        assert_eq!(t.rows().last().unwrap().balance, 8250);
+        assert_eq!(t.rows().last().unwrap().balance, 27700);
 
         // Enter through an empty debit and credit reaches the balance field; Tab never does
-        t.fields = [stem.clone(), "Arqueo".into(), String::new(), String::new(), String::new()];
+        t.fields = [stem.clone(), "Reconciled".into(), String::new(), String::new(), String::new()];
         t.focus = 1;
         t.handle(Key::Next);
         t.handle(Key::Next);
@@ -1605,27 +1605,27 @@ mod tests {
         assert_eq!(t.focus, 4);
         assert!(t.draw().contains("balance to reach: Enter adds"));
         // a lower balance is a credit of the difference
-        type_all(&mut t, "80");
+        type_all(&mut t, "270");
         t.handle(Key::Enter);
         let e = t.rows().last().unwrap();
-        assert_eq!((t.rows().len(), e.debit, e.credit, e.balance, e.desc.as_str()), (6, 0, 250, 8000, "Arqueo"));
+        assert_eq!((t.rows().len(), e.debit, e.credit, e.balance, e.desc.as_str()), (6, 0, 700, 27000, "Reconciled"));
         assert_eq!((t.focus, t.fields[4].as_str()), (0, ""));
 
         // a higher one a debit; the second decimal submits from there too
-        t.fields = [stem.clone(), "Arqueo 2".into(), String::new(), String::new(), String::new()];
+        t.fields = [stem.clone(), "Reconciled 2".into(), String::new(), String::new(), String::new()];
         t.focus = 2;
         t.handle(Key::Enter);
         t.handle(Key::Enter);
         assert_eq!(t.focus, 4);
-        type_all(&mut t, "100.25");
+        type_all(&mut t, "300.25");
         let e = t.rows().last().unwrap();
-        assert_eq!((t.rows().len(), e.debit, e.credit, e.balance), (7, 2025, 0, 10025));
+        assert_eq!((t.rows().len(), e.debit, e.credit, e.balance), (7, 3025, 0, 30025));
 
         // the same balance, or an amount as well, is refused
-        t.fields = [stem.clone(), "x".into(), String::new(), String::new(), "100.25".into()];
+        t.fields = [stem.clone(), "x".into(), String::new(), String::new(), "300.25".into()];
         t.focus = 4;
         t.handle(Key::Enter);
-        assert_eq!((t.rows().len(), t.msg.as_str()), (7, "the balance is 100.25 already"));
+        assert_eq!((t.rows().len(), t.msg.as_str()), (7, "the balance is 300.25 already"));
         t.fields = [stem.clone(), "x".into(), "1.00".into(), String::new(), "5".into()];
         t.focus = 4;
         t.handle(Key::Enter);
@@ -1635,7 +1635,7 @@ mod tests {
         t.handle(Key::Click(cell_start(&t.w, 4) + 1, t.h));
         assert_eq!(t.focus, 4);
 
-        // editing row 3 (Pago proveedor, after a balance of 150.00): a balance of 100 makes it a credit of 50
+        // editing row 3 (Coffee, after a balance of 150.00): a balance of 100 makes it a credit of 50
         t.fields = [stem.clone(), String::new(), String::new(), String::new(), String::new()];
         t.focus = 0;
         for _ in 0..5 {
@@ -1652,12 +1652,12 @@ mod tests {
 
         // `n` below row 3: a balance of 130 is a debit of 30
         t.handle(Key::Char('n'));
-        t.fields[1] = "Ajuste".into();
+        t.fields[1] = "Adjustment".into();
         t.fields[4] = "130".into();
         t.focus = 4;
         t.handle(Key::Enter);
         let e = &t.rows()[3];
-        assert_eq!((e.desc.as_str(), e.debit, e.balance, t.sel), ("Ajuste", 3000, 13000, Some(3)));
+        assert_eq!((e.desc.as_str(), e.debit, e.balance, t.sel), ("Adjustment", 3000, 13000, Some(3)));
         assert_eq!(lint(t.rows()), Vec::<String>::new());
         let _ = fs::remove_dir_all(&dir);
     }
@@ -1666,8 +1666,8 @@ mod tests {
     fn tui_cursor_in_fields() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-cursor-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::write(&file, fs::read_to_string("caja.md").unwrap().replace("2026-09-30", "2026-09-10")).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
@@ -1735,8 +1735,8 @@ mod tests {
     fn tui_amount_entry() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-amount-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::write(&file, fs::read_to_string("caja.md").unwrap().replace("2026-09-30", "2026-09-10")).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
@@ -1847,25 +1847,25 @@ mod tests {
     fn tui_inserts_below() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-insert-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::copy("caja.md", &file).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
         t.h = 24;
         t.view = 22;
         t.account = Some((path.clone(), load(&path).unwrap()));
-        t.fields[0] = "caja".into();
+        t.fields[0] = "cash".into();
         t.rebuild();
         for _ in 0..4 {
             t.handle(Key::Prev);
         }
-        assert_eq!(t.sel, Some(1)); // Venta mostrador, 2026-09-03
+        assert_eq!(t.sel, Some(1)); // Counter sale, 2026-09-02
 
         // `n`: the fields hold a new entry with that date, cursor in the description
         t.handle(Key::Char('n'));
         assert_eq!((t.editing, t.insert, t.focus), (Some(1), true, 1));
-        assert_eq!(t.fields, ["2026-09-03", "", "", "", ""]);
+        assert_eq!(t.fields, ["2026-09-02", "", "", "", ""]);
         assert!(t.draw().contains("new row below row 2: Enter saves"));
         for c in "Extra".chars() {
             t.handle(Key::Char(c));
@@ -1875,17 +1875,17 @@ mod tests {
         t.handle(Key::Char('0'));
         t.handle(Key::Enter); // a filled debit submits
         let rows = t.rows();
-        assert_eq!((rows.len(), rows[2].desc.as_str(), rows[2].date.as_str(), rows[2].debit, rows[2].balance, rows[3].balance), (6, "Extra", "2026-09-03", 1000, 16000, 7900));
+        assert_eq!((rows.len(), rows[2].desc.as_str(), rows[2].date.as_str(), rows[2].debit, rows[2].balance, rows[3].balance), (6, "Extra", "2026-09-02", 1000, 16000, 14800));
         assert_eq!((t.editing, t.insert, t.sel, t.msg.as_str()), (None, false, Some(2), "row 3 added"));
-        assert!(fs::read_to_string(&file).unwrap().contains("| 2026-09-03 | Extra"));
+        assert!(fs::read_to_string(&file).unwrap().contains("| 2026-09-02 | Extra"));
 
         // the new row is selected, so `n` chains; a date out of order is refused, Esc cancels
         t.handle(Key::Char('n'));
-        assert_eq!((t.editing, t.fields[0].as_str()), (Some(2), "2026-09-03"));
+        assert_eq!((t.editing, t.fields[0].as_str()), (Some(2), "2026-09-02"));
         t.fields = ["2026-09-06".into(), "Late".into(), String::new(), "5.00".into(), String::new()];
         t.focus = 3;
         t.handle(Key::Enter);
-        assert_eq!((t.editing, t.msg.as_str()), (Some(2), "date 2026-09-06 is after row 4 (2026-09-05)"));
+        assert_eq!((t.editing, t.msg.as_str()), (Some(2), "date 2026-09-06 is after row 4 (2026-09-03)"));
         t.handle(Key::Esc);
         assert_eq!((t.editing, t.insert, t.sel, t.rows().len()), (None, false, Some(2), 6));
         let _ = fs::remove_dir_all(&dir);
@@ -1893,15 +1893,15 @@ mod tests {
 
     #[test]
     fn search_matches() {
-        let rows = load("caja.md").unwrap().rows;
-        let venta = &rows[1]; // 2026-09-03 Venta mostrador 150.00 | 150.00
-        assert!(entry_matches(venta, "150"));
-        assert!(entry_matches(venta, "15"));
-        assert!(!entry_matches(venta, "50"));
-        assert!(entry_matches(venta, "VENTA"));
-        assert!(entry_matches(venta, "09-03"));
-        assert!(!entry_matches(venta, "x"));
-        assert!(entry_matches(venta, "-")); // a date
+        let rows = load("cash.md").unwrap().rows;
+        let sale = &rows[1]; // 2026-09-02 Counter sale 150.00 | 150.00
+        assert!(entry_matches(sale, "150"));
+        assert!(entry_matches(sale, "15"));
+        assert!(!entry_matches(sale, "50"));
+        assert!(entry_matches(sale, "COUNTER"));
+        assert!(entry_matches(sale, "09-02"));
+        assert!(!entry_matches(sale, "x"));
+        assert!(entry_matches(sale, "-")); // a date
         let e = Entry { date: "2026-01-01".into(), desc: "x".into(), debit: 0, credit: 8000, balance: -8000, bold: false };
         assert!(entry_matches(&e, "80"));
         assert!(entry_matches(&e, "-80"));
@@ -1912,15 +1912,15 @@ mod tests {
     fn tui_clears_and_searches() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-search-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::copy("caja.md", &file).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
         t.h = 24;
         t.view = 22;
         t.account = Some((path.clone(), load(&path).unwrap()));
-        t.fields = ["caja".into(), "algo".into(), "1.00".into(), String::new(), String::new()];
+        t.fields = ["cash".into(), "something".into(), "1.00".into(), String::new(), String::new()];
         t.focus = 2;
         t.rebuild();
         t.handle(Key::Prev);
@@ -1937,7 +1937,7 @@ mod tests {
 
         // `/` in a description with text is a character; on an empty one it opens the prompt
         t.account = Some((path.clone(), load(&path).unwrap()));
-        t.fields[0] = "caja".into();
+        t.fields[0] = "cash".into();
         t.rebuild();
         t.focus = 1;
         t.fields[1] = "a".into();
@@ -1948,34 +1948,34 @@ mod tests {
         assert_eq!((t.search.as_deref(), t.sel), (Some(""), None));
         assert!(t.draw().contains("\x1b[23;2H"));
 
-        // typing searches upward from the bottom: "or" is Pago proveedor, then Venta mostrador
-        t.handle(Key::Char('o'));
-        t.handle(Key::Char('r'));
-        assert_eq!(t.sel, Some(2));
-        assert!(t.draw().contains("/or   Enter/Up older"));
+        // typing searches upward from the bottom: "sa" is the Counter sale of row 4, then row 2
+        t.handle(Key::Char('s'));
+        t.handle(Key::Char('a'));
+        assert_eq!(t.sel, Some(3));
+        assert!(t.draw().contains("/sa   Enter/Up older"));
         t.handle(Key::Enter);
         assert_eq!((t.sel, t.msg.as_str()), (Some(1), ""));
         t.handle(Key::Enter);
-        assert_eq!((t.sel, t.msg.as_str()), (Some(2), "wrapped"));
+        assert_eq!((t.sel, t.msg.as_str()), (Some(3), "wrapped"));
         t.msg.clear();
         t.handle(Key::Next);
         assert_eq!((t.sel, t.msg.as_str()), (Some(1), "wrapped"));
         t.msg.clear();
         t.handle(Key::Next);
-        assert_eq!((t.sel, t.msg.as_str()), (Some(2), ""));
+        assert_eq!((t.sel, t.msg.as_str()), (Some(3), ""));
 
         // no match keeps the selection; an empty query restores the one the search began with
         t.handle(Key::Char('z'));
-        assert_eq!((t.sel, t.msg.as_str()), (Some(2), "no match"));
+        assert_eq!((t.sel, t.msg.as_str()), (Some(3), "no match"));
         t.msg.clear();
         for _ in 0..3 {
             t.handle(Key::Backspace);
         }
         assert_eq!((t.search.as_deref(), t.sel), (Some(""), None));
 
-        // amounts: "94" is the balance after Propina; Esc keeps it selected, Enter then edits
-        t.handle(Key::Char('9'));
-        t.handle(Key::Char('4'));
+        // amounts: "35" is the balance after row 4; Esc keeps it selected, Enter then edits
+        t.handle(Key::Char('3'));
+        t.handle(Key::Char('5'));
         assert_eq!(t.sel, Some(3));
         t.handle(Key::Esc);
         assert_eq!((t.search.is_none(), t.sel), (true, Some(3)));
@@ -2000,8 +2000,8 @@ mod tests {
     fn tui_fills_the_amount_from_the_description() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-expr-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
-        let file = dir.join("caja.md");
-        fs::write(&file, fs::read_to_string("caja.md").unwrap().replace("2026-09-30", "2026-09-17")).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
         let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;

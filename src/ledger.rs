@@ -528,6 +528,24 @@ pub fn row_index(n: &str, len: usize) -> Result<usize, String> {
     Ok(n - 1)
 }
 
+/// `cash.md`, the sample account, cut to its first `n` rows: the shape the interactive
+/// tests work on (five rows, all before today, so an entry dated today lands last).
+#[cfg(test)]
+pub fn cash_head(n: usize) -> String {
+    let mut rows = 0;
+    std::fs::read_to_string("cash.md")
+        .unwrap()
+        .lines()
+        .filter(|l| {
+            if !l.starts_with("| 20") {
+                return true;
+            }
+            rows += 1;
+            rows <= n
+        })
+        .fold(String::new(), |s, l| s + l + "\n")
+}
+
 #[cfg(test)]
 pub mod tests {
     use super::*;
@@ -650,19 +668,19 @@ pub mod tests {
         assert_eq!(month_add("2026-01", 12), "2027-01");
         assert_eq!(period_label("2026-09", "2026-09"), "2026-09");
 
-        let doc = load("caja.md").unwrap();
+        let doc = load("cash.md").unwrap();
         // September has everything: the opening row carries the balance before it, 0
         let d = scoped(doc, &m("2026-09", "2026-09"));
-        assert_eq!(d.rows.len(), 6);
-        assert_eq!((d.rows[0].date.as_str(), d.rows[0].desc.as_str(), d.rows[0].balance), ("2026-09-01", "Saldo", 0));
-        assert_eq!(d.rows[5].desc, "Café");
+        assert_eq!(d.rows.len(), 23);
+        assert_eq!((d.rows[0].date.as_str(), d.rows[0].desc.as_str(), d.rows[0].balance), ("2026-09-01", "Balance", 0));
+        assert_eq!(d.rows[22].desc, "Coffee");
         // a later month: nothing but the opening row with the closing balance
-        let d = scoped(load("caja.md").unwrap(), &m("2026-10", "2026-12"));
+        let d = scoped(load("cash.md").unwrap(), &m("2026-10", "2026-12"));
         assert_eq!(d.rows.len(), 1);
-        assert_eq!((d.rows[0].date.as_str(), d.rows[0].balance), ("2026-10-01", 8250));
+        assert_eq!((d.rows[0].date.as_str(), d.rows[0].balance), ("2026-10-01", 33165));
         assert_eq!(render(&d.header, &d.rows).lines().count(), 3);
         // the whole ledger untouched without a period
-        assert_eq!(scoped(load("caja.md").unwrap(), &None).rows.len(), 5);
+        assert_eq!(scoped(load("cash.md").unwrap(), &None).rows.len(), 22);
     }
 
     fn sample() -> Vec<Entry> {
@@ -797,15 +815,15 @@ pub mod tests {
 
     #[test]
     fn insert_below() {
-        let mut rows = load("caja.md").unwrap().rows;
-        assert_eq!(insert_entry(&mut rows, 1, "2026-09-02".into(), 100, 0, "x".into()).unwrap_err(), "date 2026-09-02 is before row 2 (2026-09-03)");
-        assert_eq!(insert_entry(&mut rows, 1, "2026-09-06".into(), 100, 0, "x".into()).unwrap_err(), "date 2026-09-06 is after row 3 (2026-09-05)");
-        assert!(insert_entry(&mut rows, 9, "2026-09-03".into(), 100, 0, "x".into()).is_err());
-        insert_entry(&mut rows, 1, "2026-09-04".into(), 1000, 0, "Extra".into()).unwrap();
-        assert_eq!((rows.len(), rows[2].desc.as_str(), rows[2].balance, rows[3].balance), (6, "Extra", 16000, 7900));
+        let mut rows = load("cash.md").unwrap().rows;
+        assert_eq!(insert_entry(&mut rows, 1, "2026-09-01".into(), 100, 0, "x".into()).unwrap_err(), "date 2026-09-01 is before row 2 (2026-09-02)");
+        assert_eq!(insert_entry(&mut rows, 1, "2026-09-04".into(), 100, 0, "x".into()).unwrap_err(), "date 2026-09-04 is after row 3 (2026-09-03)");
+        assert!(insert_entry(&mut rows, 30, "2026-09-03".into(), 100, 0, "x".into()).is_err());
+        insert_entry(&mut rows, 1, "2026-09-02".into(), 1000, 0, "Extra".into()).unwrap();
+        assert_eq!((rows.len(), rows[2].desc.as_str(), rows[2].balance, rows[3].balance), (23, "Extra", 16000, 14800));
         // the last row takes any later date
-        insert_entry(&mut rows, 5, "2026-12-31".into(), 0, 50, "y".into()).unwrap();
-        assert_eq!((rows.len(), rows[6].balance), (7, 9200));
+        insert_entry(&mut rows, 22, "2026-12-31".into(), 0, 50, "y".into()).unwrap();
+        assert_eq!((rows.len(), rows[23].balance), (24, 34115));
     }
 
     #[test]
