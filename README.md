@@ -18,6 +18,16 @@ mdl caja.md              # show the statement
 mdl caja.md print        # typeset it as caja.pdf
 ```
 
+## Sample
+
+[`cash.md`](cash.md) is a small Cash account with a month of entries, including a
+note row, to try the commands on:
+
+```
+mdl cash                       # show it (the .md is optional)
+mdl cash.md print --graph      # cash.pdf, with the balance charted
+```
+
 ## New accounts
 
 `mdl init <file[.md]> [--lang es|en] [title...]` writes the file with a heading, a line
