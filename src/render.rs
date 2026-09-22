@@ -3,10 +3,17 @@ use crate::ledger::{Entry, fmt_amount, fmt_col};
 
 /// Cells as text. `marked`: flagged descriptions carry their `**` (the file); the screen
 /// shows them bold instead.
+/// The rows as cell text. `marked` is the file's form: a flagged description between
+/// `**`, and any `|` in one escaped `\|` so it cannot end the cell (GFM reads it as a
+/// pipe); the screen, the PDF and JSON take the plain text.
 pub fn grid(rows: &[Entry], marked: bool) -> Vec<[String; 5]> {
     rows.iter()
         .map(|e| {
-            let desc = if marked && e.bold { format!("**{}**", e.desc) } else { e.desc.clone() };
+            let desc = match (marked, e.bold) {
+                (false, _) => e.desc.clone(),
+                (true, false) => e.desc.replace('|', "\\|"),
+                (true, true) => format!("**{}**", e.desc.replace('|', "\\|")),
+            };
             [e.date.clone(), desc, fmt_col(e.debit), fmt_col(e.credit), fmt_amount(e.balance)]
         })
         .collect()

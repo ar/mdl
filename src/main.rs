@@ -64,8 +64,9 @@ Git (the current directory is the account tree)
   mdl sync [message...]                fetch, then push
   git config mdl.autocommit true       every save commits and pushes
 
-period      YYYY-MM [YYYY-MM] | this | last [N]: months; the statement opens
-            with the balance before them
+period      YYYY-MM [YYYY-MM] | this [N] | last [N]: months; this N ends with
+            the current month, last N with the previous one; the statement
+            opens with the balance before them
 --date D    D is YYYY-MM-DD, today by default; a date before the last row
             inserts the entry in date order, after the rows on that day
 amount      1234.50, or a computation: 100+200+50, 1000*40.50

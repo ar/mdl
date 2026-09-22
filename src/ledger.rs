@@ -66,8 +66,8 @@ pub fn month_add(ym: &str, n: i64) -> String {
 }
 
 /// The months a statement covers, from the words after the command: none (the whole
-/// ledger), `YYYY-MM`, `YYYY-MM YYYY-MM` (inclusive), `this`, `last`, or `last N` (the N
-/// months before the current one).
+/// ledger), `YYYY-MM`, `YYYY-MM YYYY-MM` (inclusive), `this` or `this N` (the N months
+/// ending with the current one), `last` or `last N` (the N months before it).
 pub fn period(words: &[String], today: &str) -> Result<Option<(String, String)>, String> {
     let this = &today[..7];
     let w: Vec<&str> = words.iter().map(|s| s.as_str()).collect();
@@ -75,13 +75,14 @@ pub fn period(words: &[String], today: &str) -> Result<Option<(String, String)>,
         [] => return Ok(None),
         ["this"] => (this.to_string(), this.to_string()),
         ["last"] => (month_add(this, -1), month_add(this, -1)),
-        ["last", n] => {
+        ["this" | "last", n] => {
             let n: i64 = n.parse().ok().filter(|n| *n > 0).ok_or(format!("bad month count `{n}`"))?;
-            (month_add(this, -n), month_add(this, -1))
+            let end = if w[0] == "this" { 0 } else { -1 };
+            (month_add(this, end - n + 1), month_add(this, end))
         }
         [a] if valid_month(a) => (a.to_string(), a.to_string()),
         [a, b] if valid_month(a) && valid_month(b) && a <= b => (a.to_string(), b.to_string()),
-        _ => return Err(format!("bad period `{}`: YYYY-MM [YYYY-MM] | this | last [N]", w.join(" "))),
+        _ => return Err(format!("bad period `{}`: YYYY-MM [YYYY-MM] | this [N] | last [N]", w.join(" "))),
     }))
 }
 
@@ -117,12 +118,26 @@ pub fn today() -> String {
     format!("{y:04}-{m:02}-{d:02}")
 }
 
-// ponytail: no `\|` escaping; descriptions can't contain a pipe.
+/// The cells of a table line, or None for a line that is not one. A `\|` is a pipe
+/// inside a cell, as in GFM, not a cell boundary (`render` writes one for every `|` in
+/// a description).
 fn cells(line: &str) -> Option<Vec<String>> {
     let l = line.trim();
     let l = l.strip_prefix('|')?;
     let l = l.strip_suffix('|').unwrap_or(l);
-    Some(l.split('|').map(|c| c.trim().to_string()).collect())
+    let mut out = vec![String::new()];
+    let mut chars = l.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\\' if chars.peek() == Some(&'|') => {
+                chars.next();
+                out.last_mut().unwrap().push('|');
+            }
+            '|' => out.push(String::new()),
+            c => out.last_mut().unwrap().push(c),
+        }
+    }
+    Some(out.into_iter().map(|c| c.trim().to_string()).collect())
 }
 
 fn is_separator(line: &str) -> bool {
@@ -425,9 +440,6 @@ fn check_entry(date: &str, debit: i64, credit: i64, desc: &str) -> Result<(), St
     if desc.is_empty() {
         return Err("missing description".into());
     }
-    if desc.contains('|') {
-        return Err("description can't contain `|`".into());
-    }
     if debit < 0 || credit < 0 || (debit > 0 && credit > 0) {
         return Err("one positive amount, debit or credit (or neither for a note)".into());
     }
@@ -661,9 +673,11 @@ pub mod tests {
         assert_eq!(p("this"), Ok(m("2026-02", "2026-02")));
         assert_eq!(p("last"), Ok(m("2026-01", "2026-01")));
         assert_eq!(p("last 3"), Ok(m("2025-11", "2026-01")));
+        assert_eq!(p("this 1"), Ok(m("2026-02", "2026-02")));
+        assert_eq!(p("this 3"), Ok(m("2025-12", "2026-02"))); // ends with the current month
         assert_eq!(p("2026-09"), Ok(m("2026-09", "2026-09")));
         assert_eq!(p("2026-07 2026-09"), Ok(m("2026-07", "2026-09")));
-        assert!(p("2026-13").is_err() && p("2026-09 2026-07").is_err() && p("last 0").is_err() && p("last x").is_err());
+        assert!(p("2026-13").is_err() && p("2026-09 2026-07").is_err() && p("last 0").is_err() && p("last x").is_err() && p("this 0").is_err());
         assert_eq!(month_add("2026-01", 11), "2026-12");
         assert_eq!(month_add("2026-01", 12), "2027-01");
         assert_eq!(period_label("2026-09", "2026-09"), "2026-09");
@@ -811,6 +825,26 @@ pub mod tests {
         assert!(lint(&rows).is_empty());
         rows[1].desc = "#10+20 b".into(); // a positive computation on a credit row is wrong
         assert_eq!(lint(&rows), ["row 2: description computes 30.00 but the row is -30.00"]);
+    }
+
+    /// A `|` in a description is written `\|` and read back as a pipe; the cell count
+    /// is unaffected either way.
+    #[test]
+    fn pipes_in_descriptions_round_trip() {
+        let header: Vec<String> = ["Date", "Description", "Debit", "Credit", "Balance"].iter().map(|s| s.to_string()).collect();
+        let rows = vec![
+            Entry { date: "2026-09-01".into(), desc: "A | B corp".into(), debit: 100, credit: 0, balance: 100, bold: false },
+            Entry { date: "2026-09-02".into(), desc: "x|y|z".into(), debit: 0, credit: 50, balance: 50, bold: true },
+        ];
+        let text = render(&header, &rows);
+        assert!(text.contains("| A \\| B corp |"), "{text}");
+        assert!(text.contains("| **x\\|y\\|z** |"), "{text}");
+        let (h, back) = load_str(&text);
+        assert_eq!(h, header);
+        assert_eq!((back[0].desc.as_str(), back[1].desc.as_str(), back[1].bold), ("A | B corp", "x|y|z", true));
+        assert_eq!(cells("| a \\| b | c |").unwrap(), ["a | b", "c"]);
+        assert_eq!(cells("| a \\ b | c |").unwrap(), ["a \\ b", "c"]); // a backslash alone is text
+        assert!(lint(&back).is_empty());
     }
 
     #[test]

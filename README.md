@@ -2,7 +2,8 @@
 
 Ledgers as Markdown tables. Each account is a `.md` file whose first 5-column table is
 `| date | description | debit | credit | balance |`; `mdl` edits it from the terminal,
-checks it, and prints it.
+checks it, and prints it. A `|` in a description is written `\|` in the file, as GFM
+reads it, so the table stays a table.
 
 ## Install
 
@@ -153,6 +154,7 @@ mdl caja.md print 2026-07 2026-08     inclusive range        → caja-2026-07-20
 mdl caja.md print last                the previous month
 mdl caja.md print last 2              the two months before this one
 mdl caja.md print this                the current month
+mdl caja.md print this 2              the previous month and this one
 mdl caja.md print --graph last 3      with the balance charted after the table
 mdl bills.md print --graph debit      each entry's debit charted instead
 mdl caja.md print --graph debit credit   both amounts, in two colours
