@@ -200,6 +200,6 @@ pub fn push(dir: &Path) -> String {
     }
 }
 
-fn has_remote(dir: &Path) -> bool {
+pub fn has_remote(dir: &Path) -> bool {
     git(dir, &["remote"]).map(|o| o.status.success() && !o.stdout.is_empty()).unwrap_or(false)
 }

@@ -12,7 +12,8 @@
 //!
 //! Git: `fetch`, `push` and `sync` work on the current directory (the account tree),
 //! scoped to it. With `git config mdl.autocommit true` in that repository every
-//! save also commits the file and pushes best-effort. See git.rs.
+//! save also commits the file and pushes best-effort. The interactive screen fetches
+//! on the way in and syncs on the way out. See git.rs and tui.rs.
 mod git;
 mod ledger;
 mod print;
@@ -63,6 +64,7 @@ Git (the current directory is the account tree)
   mdl push [message...]                commit everything pending and push
   mdl sync [message...]                fetch, then push
   git config mdl.autocommit true       every save commits and pushes
+  (leaving the interactive screen syncs whatever is pending)
 
 period      YYYY-MM [YYYY-MM] | this [N] | last [N]: months; this N ends with
             the current month, last N with the previous one; the statement

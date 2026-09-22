@@ -403,7 +403,9 @@ fn status_now(s: &str) {
 //
 // Git: the screen starts a fetch in the background (unless fetched within 15 minutes)
 // and opening an account waits for it, so the account read is the current one; Ctrl-S
-// fetches + commits + pushes, and with `mdl.autocommit` every save does.
+// fetches + commits + pushes, and with `mdl.autocommit` every save does. Leaving the
+// screen (Esc) syncs the same way when anything is pending or unpushed, so nothing
+// stays behind on this machine; a clean, pushed tree leaves at once.
 struct Tui {
     h: usize,
     cols: usize,
@@ -1145,6 +1147,30 @@ impl Tui {
         self.reload();
     }
 
+    /// Leaving the screen: like Ctrl-S (fetch, then commit and push what is pending),
+    /// but only when there is something to push; a clean, pushed tree leaves with no
+    /// round trip. A background pull still running is waited for first, so two git
+    /// operations never overlap. None: nothing was done.
+    fn quit_sync(&mut self) -> Option<Result<String, String>> {
+        if !self.in_repo {
+            return None;
+        }
+        let dir = self.dir;
+        if let Err(e) = self.finish_pull() {
+            return Some(Err(e));
+        }
+        let pending = match git::pending(dir) {
+            Ok(p) => p,
+            Err(e) => return Some(Err(e)),
+        };
+        let pushed = if git::has_upstream(dir) { git::unpushed(dir) == 0 } else { !git::has_remote(dir) };
+        if pending.is_empty() && pushed {
+            return None;
+        }
+        status_now("syncing…");
+        Some(git::pull(dir).and_then(|(_, n)| push_pending(dir, "").map(|(_, p)| format!("{n}; {p}"))))
+    }
+
     fn accept_recalc(&mut self, key: &Key) {
         self.offer_recalc = false;
         if let (Key::Enter, Some((_, doc))) = (key, self.account.as_mut()) {
@@ -1422,7 +1448,7 @@ impl Tui {
 }
 
 pub fn tui() -> Result<(), String> {
-    let _raw = Raw::enter().ok_or("not a terminal")?;
+    let raw = Raw::enter().ok_or("not a terminal")?;
     let mut stdin = io::stdin().lock();
     let mut t = Tui::new();
     t.start_pull();
@@ -1448,7 +1474,20 @@ pub fn tui() -> Result<(), String> {
             }
         }
     }
-    Ok(())
+    // sync while still on the screen (the status line says so), report once off it
+    let note = t.quit_sync();
+    drop(raw);
+    match note {
+        None => Ok(()),
+        Some(Err(e)) => Err(e),
+        Some(Ok(n)) => {
+            eprintln!("{n}");
+            if n.contains("push failed") {
+                return Err("the remote may have moved on; run `mdl fetch` and push again".into());
+            }
+            Ok(())
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1857,6 +1896,50 @@ mod tests {
         t.handle(Key::Enter);
         assert_eq!((t.rows()[5].debit, t.rows()[5].balance, t.editing), (1000, 28700, None));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// Leaving the screen pushes what is pending, after a fetch; a clean, pushed tree
+    /// leaves without touching git.
+    #[test]
+    fn tui_quit_syncs() {
+        use std::process::Command;
+        let sh = |dir: &Path, args: &[&str]| {
+            let o = Command::new("git").arg("-C").arg(dir).args(args).output().expect("git");
+            assert!(o.status.success(), "git {:?}: {}", args, String::from_utf8_lossy(&o.stderr));
+        };
+        let base = std::env::temp_dir().join(format!("mdl-tui-quit-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&base);
+        let (remote, a, b) = (base.join("remote.git"), base.join("a"), base.join("b"));
+        fs::create_dir_all(&remote).unwrap();
+        sh(&remote, &["-c", "init.defaultBranch=main", "init", "--bare", "--quiet"]);
+        let clone = |dst: &Path| {
+            sh(&base, &["clone", "--quiet", remote.to_str().unwrap(), dst.to_str().unwrap()]);
+            sh(dst, &["config", "user.email", "t@example.com"]);
+            sh(dst, &["config", "user.name", "t"]);
+            sh(dst, &["config", "commit.gpgsign", "false"]);
+        };
+        clone(&a);
+        let mut t = Tui::new();
+        t.dir = Box::leak(a.clone().into_boxed_path());
+        t.in_repo = true;
+        // a fresh clone with a new account: committed and pushed on the way out
+        fs::write(a.join("caja.md"), cash_head(3)).unwrap();
+        assert_eq!(t.quit_sync().unwrap().unwrap(), "no upstream branch yet; committed: mdl: update caja; pushed");
+        // clean and pushed: nothing to do, no note
+        assert!(t.quit_sync().is_none());
+        // the remote moved on and a local edit is pending: fetched, committed, pushed
+        clone(&b);
+        fs::write(b.join("banco.md"), cash_head(2)).unwrap();
+        assert_eq!(push_pending(&b, "from b").unwrap().1, "committed: from b; pushed");
+        fs::write(a.join("caja.md"), cash_head(4)).unwrap();
+        assert_eq!(t.quit_sync().unwrap().unwrap(), "fast-forwarded to the upstream; committed: mdl: update caja; pushed");
+        assert!(a.join("banco.md").exists());
+        assert_eq!(git::unpushed(&a), 0);
+        assert!(t.quit_sync().is_none());
+        // not a repository: never touched
+        t.in_repo = false;
+        assert!(t.quit_sync().is_none());
+        let _ = fs::remove_dir_all(&base);
     }
 
     #[test]
