@@ -371,6 +371,27 @@ pub fn load(file: &str) -> Result<Doc, String> {
     Ok(Doc { lines: lines.iter().map(|l| l.to_string()).collect(), start, end, header, rows })
 }
 
+/// Several accounts as one: their rows merged in date order (stable, so a day keeps
+/// the accounts' order), each description led by its account's file stem, the balance
+/// run over all of them. Titled after the accounts' titles; no prose.
+pub fn combine(files: &[String]) -> Result<Doc, String> {
+    let mut titles = vec![];
+    let mut rows = vec![];
+    let mut header = vec![];
+    for f in files {
+        let doc = load(f)?;
+        let stem = Path::new(f).file_stem().map_or(f.clone(), |s| s.to_string_lossy().into_owned());
+        titles.push(doc.title().map_or(stem.clone(), |t| t[2..].trim().to_string()));
+        rows.extend(doc.rows.into_iter().map(|e| Entry { desc: format!("{stem}: {}", e.desc), ..e }));
+        if header.is_empty() {
+            header = doc.header;
+        }
+    }
+    rows.sort_by(|a: &Entry, b: &Entry| a.date.cmp(&b.date));
+    recalc(&mut rows);
+    Ok(Doc { lines: vec![format!("# {}", titles.join(" + "))], start: 1, end: 1, header, rows })
+}
+
 impl Doc {
     pub fn title(&self) -> Option<&str> {
         self.lines.iter().find(|l| l.starts_with("# ")).map(|l| l.as_str())

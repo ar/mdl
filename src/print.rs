@@ -239,15 +239,18 @@ fn render_chart(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> S
 
 /// `print`: the statement typeset by `typst` (the source on its stdin) as `<file>.pdf`,
 /// or `<file>-<from>[-<to>].pdf` for a period; with `series`, those charted after the
-/// table.
-pub fn print_pdf(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String]) -> Result<String, String> {
+/// table. `out` overrides the PDF's path.
+pub fn print_pdf(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String], out: Option<&str>) -> Result<String, String> {
     let suffix = match p {
         Some((a, b)) if a == b => format!("-{a}"),
         Some((a, b)) => format!("-{a}-{b}"),
         None => String::new(),
     };
     let stem = Path::new(file).with_extension("");
-    let pdf = Path::new(&format!("{}{suffix}", stem.display())).with_extension("pdf");
+    let pdf = match out {
+        Some(o) => Path::new(o).to_path_buf(),
+        None => Path::new(&format!("{}{suffix}", stem.display())).with_extension("pdf"),
+    };
     let mut child = process::Command::new("typst")
         .args(["compile", "-", &pdf.to_string_lossy()])
         .stdin(process::Stdio::piped())

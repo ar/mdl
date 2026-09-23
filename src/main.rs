@@ -42,11 +42,14 @@ Read
   mdl <file> [show] [--pretty|--markdown|--json] [period]
                                        the statement, with borders and totals
                                        by default; --markdown uses a GFM table
-  mdl <file> print [--graph [balance|debit|credit]...] [period]
-                                       typeset to <file>.pdf; --graph charts
-                                       the balance, or each entry's amounts
+  mdl <file> print [-o <pdf>] [--graph [balance|debit|credit]...] [period]
+                                       typeset to <file>.pdf, or <pdf>; --graph
+                                       charts the balance, or each entry's amounts
   mdl <file> lint                      check dates, balances and #expressions
   mdl <file> balance                   the closing balance
+  mdl <file> <file>... show|print ...  several accounts as one (bank/*.md):
+                                       merged by date, each description led
+                                       by its account, one running balance
   mdl balance [--total] <file>...      several accounts, and their sum
 
 Write
@@ -79,13 +82,8 @@ amount      1234.50, or a computation: 100+200+50, 1000*40.50
             it, and the interactive screen fills the amount from it
 ";
 
-fn usage() -> ! {
-    eprint!("{USAGE}");
-    process::exit(2)
-}
-
 /// A command line that does not parse: one line saying what is missing, and where the
-/// full usage is. Exit status 2, like `usage`.
+/// full usage is. Exit status 2.
 fn bad(what: &str) -> ! {
     eprintln!("mdl: {what} (see mdl --help)");
     process::exit(2)
@@ -276,18 +274,32 @@ fn run() -> Result<(), String> {
         }
         _ => {}
     }
+    // More accounts may follow the first (a shell glob, say): every word up to the
+    // command that names an existing file. show and print combine them.
+    const COMMANDS: [&str; 12] = ["show", "print", "lint", "balance", "recalc", "debit", "credit", "note", "edit", "move", "flag", "delete"];
+    let n = 1 + args[1..].iter().take_while(|a| !COMMANDS.contains(&a.as_str()) && Path::new(&resolve(a)).is_file()).count();
+    let files: Vec<String> = args[..n].iter().map(|f| resolve(f)).collect();
     // Display flags and period selectors imply `show`; validation stays in the
     // same period parser used by `print`.
     let show = "show".to_string();
-    let (file, cmd, rest): (&String, &String, &[String]) = match args.as_slice() {
-        [file] => (file, &show, &[]),
-        [file, first, ..] if ["--json", "--pretty", "--markdown", "this", "last"].contains(&first.as_str())
-            || first.as_bytes().first().is_some_and(u8::is_ascii_digit) => (file, &show, &args[1..]),
-        [file, cmd, rest @ ..] => (file, cmd, rest),
-        _ => usage(),
+    let (cmd, rest): (&String, &[String]) = match &args[n..] {
+        [] => (&show, &[]),
+        [first, ..] if ["--json", "--pretty", "--markdown", "this", "last"].contains(&first.as_str())
+            || first.as_bytes().first().is_some_and(u8::is_ascii_digit) => (&show, &args[n..]),
+        [cmd, rest @ ..] => (cmd, rest),
     };
-    let file = &resolve(file);
-    let mut doc = load(file)?;
+    let combined;
+    let file = if files.len() == 1 {
+        &files[0]
+    } else if cmd == "show" || cmd == "print" {
+        // ponytail: the PDF is named after every stem; a long glob makes a long name
+        let stems: Vec<String> = files.iter().map(|f| Path::new(f).file_stem().unwrap_or_default().to_string_lossy().into_owned()).collect();
+        combined = Path::new(&files[0]).with_file_name(stems.join("+")).with_extension("md").to_string_lossy().into_owned();
+        &combined
+    } else {
+        bad(&format!("{cmd} takes one account; only show and print combine several"))
+    };
+    let mut doc = if files.len() == 1 { load(file)? } else { ledger::combine(&files)? };
     let what: String;
 
     match cmd.as_str() {
@@ -321,14 +333,21 @@ fn run() -> Result<(), String> {
         }
         "print" => {
             // --graph [balance|debit|credit]...: the series words anywhere, balance alone by default
-            let (flags, words): (Vec<String>, Vec<String>) = rest.iter().cloned().partition(|w| ["--graph", "balance", "debit", "credit"].contains(&w.as_str()));
+            // -o <file>: where the PDF goes, instead of the name print_pdf derives
+            let mut rest = rest.to_vec();
+            let out = match rest.iter().position(|w| w == "-o") {
+                Some(i) if i + 1 < rest.len() => Some(rest.drain(i..i + 2).nth(1).unwrap()),
+                Some(_) => bad("print: -o needs a file name"),
+                None => None,
+            };
+            let (flags, words): (Vec<String>, Vec<String>) = rest.into_iter().partition(|w| ["--graph", "balance", "debit", "credit"].contains(&w.as_str()));
             let mut series: Vec<String> = flags.iter().filter(|w| *w != "--graph").cloned().collect();
             if series.is_empty() && !flags.is_empty() {
                 series.push("balance".into());
             }
             let p = period(&words, &today())?;
             let doc = scoped(doc, &p);
-            println!("{}", print_pdf(&doc, file, &p, &series)?);
+            println!("{}", print_pdf(&doc, file, &p, &series, out.as_deref())?);
             return Ok(());
         }
         "balance" => {
@@ -435,6 +454,26 @@ mod tests {
         let out = init_text(Some(notes), "Caja", "es", "2026-09-18").unwrap();
         let (header, rows) = load_str(&out);
         assert_eq!((header[2].as_str(), rows.len(), rows[0].desc.as_str()), ("Debe", 1, "Saldo inicial"));
+    }
+
+    #[test]
+    fn combine_merges_by_date() {
+        let dir = std::env::temp_dir().join(format!("mdl-combine-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let bank = dir.join("bank.md");
+        fs::write(&bank, "# Bank\n\n| D | Desc | Dr | Cr | Bal |\n|---|---|--:|--:|--:|\n| 2026-09-02 | Deposit | 10.00 | | 10.00 |\n| 2026-09-20 | Fee | | 1.00 | 9.00 |\n").unwrap();
+        let files = ["cash.md".to_string(), bank.to_str().unwrap().to_string()];
+        let doc = ledger::combine(&files).unwrap();
+        assert_eq!(doc.title(), Some("# Cash + Bank"));
+        assert_eq!(doc.header[4], "Balance");
+        let cash = load("cash.md").unwrap();
+        assert_eq!(doc.rows.len(), cash.rows.len() + 2);
+        // same day: the accounts' order; the balance runs over both
+        assert_eq!((doc.rows[1].desc.as_str(), doc.rows[2].desc.as_str()), ("cash: Counter sale", "bank: Deposit"));
+        assert_eq!(doc.rows[2].balance, 15000 + 1000);
+        assert_eq!(balance(&doc.rows), balance(&cash.rows) + 900);
+        assert!(lint(&doc.rows).is_empty());
+        fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
