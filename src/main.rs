@@ -20,13 +20,13 @@ mod print;
 mod render;
 mod tui;
 
-use std::io;
+use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::{env, fs, process};
 
 use ledger::{Entry, add_entry, amount_arg, balance, delete_entry, edit_entry, entry_what, find_table, fmt_amount, lint, load, move_entry, period, push_pending, recalc, recalc_diff, resolve, row_index, save_commit, scoped, today};
 use print::print_pdf;
-use render::{render, render_json};
+use render::{render, render_json, render_pretty};
 use tui::{scan_accounts, tui};
 
 const USAGE: &str = "\
@@ -39,7 +39,9 @@ usage: mdl [<file>[.md]] [<command> [args...]]
   mdl --help | --version
 
 Read
-  mdl <file> [show] [--json] [period]  the statement (the default command)
+  mdl <file> [show] [--pretty|--markdown|--json] [period]
+                                       the statement, with borders and totals
+                                       by default; --markdown uses a GFM table
   mdl <file> print [--graph [balance|debit|credit]...] [period]
                                        typeset to <file>.pdf; --graph charts
                                        the balance, or each entry's amounts
@@ -274,11 +276,13 @@ fn run() -> Result<(), String> {
         }
         _ => {}
     }
-    // `mdl <file>` and `mdl <file> --json` default to `show`.
+    // Display flags and period selectors imply `show`; validation stays in the
+    // same period parser used by `print`.
     let show = "show".to_string();
     let (file, cmd, rest): (&String, &String, &[String]) = match args.as_slice() {
         [file] => (file, &show, &[]),
-        [file, j] if j == "--json" => (file, &show, &args[1..]),
+        [file, first, ..] if ["--json", "--pretty", "--markdown", "this", "last"].contains(&first.as_str())
+            || first.as_bytes().first().is_some_and(u8::is_ascii_digit) => (file, &show, &args[1..]),
         [file, cmd, rest @ ..] => (file, cmd, rest),
         _ => usage(),
     };
@@ -292,18 +296,26 @@ fn run() -> Result<(), String> {
             return if errs.is_empty() { Ok(()) } else { Err(errs.join("\n")) };
         }
         "show" => {
-            let (json, words) = match rest {
-                [j, r @ ..] if j == "--json" => (true, r),
-                r => (false, r),
-            };
-            let doc = scoped(doc, &period(words, &today())?);
+            let json = rest.iter().any(|a| a == "--json");
+            let markdown = rest.iter().any(|a| a == "--markdown");
+            let explicit_pretty = rest.iter().any(|a| a == "--pretty");
+            if json as u8 + markdown as u8 + explicit_pretty as u8 > 1 {
+                bad("show: choose only one of --pretty, --markdown, or --json");
+            }
+            let pretty = !json && !markdown;
+            let words: Vec<String> = rest.iter().filter(|a| !["--json", "--pretty", "--markdown"].contains(&a.as_str())).cloned().collect();
+            let doc = scoped(doc, &period(&words, &today())?);
             if json {
                 print!("{}", render_json(doc.title().map(|t| t[2..].trim()), &doc.rows));
             } else {
                 if let Some(t) = doc.title() {
-                    println!("{t}\n");
+                    println!("{}\n", if pretty { t[2..].trim() } else { t });
                 }
-                print!("{}", render(&doc.header, &doc.rows));
+                print!("{}", if pretty {
+                    render_pretty(&doc.header, &doc.rows, io::stdout().is_terminal())
+                } else {
+                    render(&doc.header, &doc.rows)
+                });
             }
             return Ok(());
         }

@@ -119,6 +119,24 @@ pub fn render(header: &[String], rows: &[Entry]) -> String {
     render_cols(header, &g, &natural_widths(header, &g))
 }
 
+/// A CLI statement using the TUI's borders and totals. Include the totals in the
+/// width calculation so a sum wider than any entry still fits its column. Styling
+/// is optional so redirected output contains only the readable Unicode table.
+pub fn render_pretty(header: &[String], rows: &[Entry], styled: bool) -> String {
+    let g = grid(rows, false);
+    let foot = totals(rows);
+    let w = natural_widths(header, &[g.as_slice(), std::slice::from_ref(&foot)].concat());
+    let lines = render_lines(header, &g, &w, Some(&foot));
+    let total_line = lines.len() - 2;
+    lines.into_iter().enumerate().map(|(i, (line, entry))| {
+        if styled && (i == 1 || i == total_line || entry.is_some_and(|j| rows[j].bold)) {
+            format!("\x1b[1m{line}\x1b[0m\n")
+        } else {
+            line + "\n"
+        }
+    }).collect()
+}
+
 pub fn json_str(s: &str) -> String {
     let mut out = String::from("\"");
     for c in s.chars() {
@@ -150,4 +168,34 @@ pub fn render_json(title: Option<&str>, rows: &[Entry]) -> String {
         title.map_or("null".into(), json_str),
         entries.join(",\n")
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn pretty_totals_fit_and_descriptions_remain_literal() {
+        let header = ["Fecha", "Descripción", "D", "C", "Saldo"].map(String::from);
+        let rows: Vec<Entry> = (1..=2).map(|day| Entry {
+            date: format!("2026-09-{day:02}"),
+            desc: "Café | caja".into(),
+            debit: 99999,
+            credit: 0,
+            balance: day * 99999,
+            bold: day == 1,
+        }).collect();
+        let plain = render_pretty(&header, &rows, false);
+        let width = plain.lines().next().unwrap().chars().count();
+        assert!(plain.lines().all(|l| l.chars().count() == width));
+        assert!(plain.contains("1999.98"));
+        assert!(plain.contains("Café | caja"));
+        assert!(!plain.contains("\\|"));
+        assert!(!plain.contains("**"));
+        assert!(!plain.contains('\x1b'));
+        let styled = render_pretty(&header, &rows, true);
+        assert!(styled.contains("\x1b[1m│ 2026-09-01"));
+        assert!(!styled.contains("\x1b[1m│ 2026-09-02"));
+        assert!(render_pretty(&header, &[], false).ends_with("┘\n"));
+    }
 }

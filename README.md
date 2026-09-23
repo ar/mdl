@@ -25,9 +25,31 @@ mdl caja.md print        # typeset it as caja.pdf
 note row, to try the commands on:
 
 ```
-mdl cash                       # show it (the .md is optional)
+mdl cash                       # bordered table with totals (the .md is optional)
+mdl cash --markdown            # the original Markdown table
+mdl cash show 2026-09          # a monthly statement
 mdl cash.md print --graph      # cash.pdf, with the balance charted
 ```
+
+The default display uses the interactive screen's table borders and totals, preserving the
+account's column labels. Headers, totals, and flagged entries appear bold in a
+terminal; redirected output has no terminal escape codes. Use `--markdown` for the
+original Markdown output or `--json` for JSON. `--pretty` explicitly selects the
+default format; these three output flags are mutually exclusive.
+
+The display accepts the same periods as `print`, with or without `show`:
+
+```
+mdl cash last                   # the previous month
+mdl cash last 3                 # the three months before this one
+mdl cash this                   # the current month
+mdl cash this 3                 # the current month and the two before it
+mdl cash 2026-07 2026-09         # an inclusive month range
+mdl cash show last 3 --markdown # the same period as a Markdown table
+```
+
+Each period starts with its opening balance; debit and credit totals cover only
+entries within that period. Output flags may appear before or after the period.
 
 ## Interactive entry
 
