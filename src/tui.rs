@@ -1,7 +1,8 @@
 //! Interactive data entry: raw mode, keys and mouse, the screen, the state machine.
+use std::cell::Cell;
 use std::io::{self, Read, Write};
 use std::path::Path;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 use std::{fs, process};
 
 use crate::git;
@@ -344,16 +345,42 @@ fn amount_view(s: &str, w: usize, focused: bool, cur: usize) -> (String, usize) 
     }
 }
 
-/// Status line right now, ahead of a call that will block (a fetch).
-fn status_now(s: &str) {
-    print!("\r\x1b[1A\x1b[2K{s}\x1b[1B");
-    io::stdout().flush().ok();
+/// Persistent git feedback, independent of search, completion and editing hints.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum GitStatus {
+    Unknown, Updated, Current, Synced, Pending, Offline, Local, Failed,
+}
+
+impl GitStatus {
+    fn from_note(note: &str, full_sync: bool) -> Self {
+        if note.contains("push failed") { Self::Pending }
+        else if note.contains("fetch failed") { Self::Offline }
+        else if note.contains("no remote") { Self::Local }
+        else if full_sync { Self::Synced }
+        else if note.contains("no upstream") { Self::Local }
+        else if note.contains("not yet pushed") { Self::Pending }
+        else if note.contains("fast-forwarded") || note.contains("merged") { Self::Updated }
+        else { Self::Current }
+    }
+
+    fn label(self) -> (&'static str, u8) {
+        match self {
+            Self::Unknown => ("Git: unchecked", 2),
+            Self::Updated => ("✓ Updated", 32),
+            Self::Current => ("✓ Up to date", 32),
+            Self::Synced => ("✓ Synced", 32),
+            Self::Pending => ("↑ Pending push", 33),
+            Self::Offline => ("! Offline", 33),
+            Self::Local => ("Git: local only", 2),
+            Self::Failed => ("! Sync failed", 31),
+        }
+    }
 }
 
 // ponytail: raw mode via `stty` + ANSI escapes; no crates. The screen is a viewport
 // over the statement (bottom-aligned, wheel / PgUp / PgDn scroll it; it ends with the
 // debit and credit totals between two rules) with a status
-// row and the entry fields on the last two rows; the whole frame is redrawn in place
+// row, bordered entry panel and footer; the whole frame is redrawn in place
 // on every key. The fields are one more table row on the same column grid; long
 // input scrolls within its field.
 //
@@ -409,7 +436,7 @@ fn status_now(s: &str) {
 struct Tui {
     h: usize,
     cols: usize,
-    /// Statement rows on screen: everything but the status and field rows.
+    /// Statement rows on screen, above the status, entry panel and footer.
     view: usize,
     w: [usize; 5],
     account_w: usize,
@@ -459,6 +486,8 @@ struct Tui {
     /// The highlighted account match: for which text in the account field, and its index
     /// in `account_matches`; any other text means the first match.
     pick: (String, usize),
+    git_status: Cell<GitStatus>,
+    busy: Cell<Option<(&'static str, Instant)>>,
 }
 
 impl Tui {
@@ -473,7 +502,7 @@ impl Tui {
         Tui {
             h,
             cols,
-            view: h - 2,
+            view: h.saturating_sub(if h >= 12 { 6 } else { 3 }),
             w: tui_widths(&header, &[], cols, account_w),
             account_w,
             accounts,
@@ -498,6 +527,8 @@ impl Tui {
             last_pull: None,
             pull_job: None,
             pick: (String::new(), 0),
+            git_status: Cell::new(GitStatus::Unknown),
+            busy: Cell::new(None),
         }
     }
 
@@ -644,8 +675,6 @@ impl Tui {
             "balance to reach: Enter adds the debit or credit that gets there (empty: a note)".into()
         } else if let Some(strip) = self.completion_strip() {
             strip
-        } else if self.pull_job.is_some() {
-            "syncing with the remote in the background…".into()
         } else {
             String::new()
         };
@@ -656,24 +685,136 @@ impl Tui {
         } else {
             out.extend(status.chars().take(self.cols));
         }
-        out += "\r\n\x1b[2K│ ";
+        if self.panel_expanded() {
+            let title = match self.editing {
+                Some(i) if self.insert => format!("Insert below row {}", i + 1),
+                Some(i) => format!("Editing row {}", i + 1),
+                None => "New entry".into(),
+            };
+            let width = self.w.iter().sum::<usize>() + 16;
+            let title: String = title.chars().take(width.saturating_sub(5)).collect();
+            out += &format!("\r\n\x1b[2K\x1b[2m╭─ {title} {}╮\x1b[0m", "─".repeat(width.saturating_sub(title.chars().count() + 5)));
+            out += "\r\n\x1b[2K\x1b[2m│ \x1b[0m";
+            let first = if self.editing.is_some() { "Date" } else { "Account" };
+            for (i, label) in [first, "Description", "Debit", "Credit", "Balance"].iter().enumerate() {
+                let label: String = label.chars().take(self.w[i]).collect();
+                let style = if i == self.focus { "\x1b[1;36m" } else { "\x1b[2m" };
+                out += &format!("{style}{label:<width$}\x1b[0m\x1b[2m │{}\x1b[0m", if i < 4 { " " } else { "" }, width = self.w[i]);
+            }
+        }
+        out += "\r\n\x1b[2K\x1b[2m│ \x1b[0m";
         let view = |i: usize| {
             let (f, w) = (&self.fields[i], self.w[i]);
             let cur = if i == self.focus { self.cur() } else { usize::MAX };
             if i >= 2 { amount_view(f, w, i == self.focus, cur) } else { field_view(f, w, cur) }
         };
         for i in 0..5 {
-            let style = if i == self.focus { "\x1b[47;30m" } else { "\x1b[100m" };
+            let style = if i == self.focus { "\x1b[7m" } else { "\x1b[0m" };
             let (shown, _) = view(i);
-            out += &format!("{style}{shown:<width$}\x1b[0m │{}", if i < 4 { " " } else { "" }, width = self.w[i]);
+            out += &format!("{style}{shown:<width$}\x1b[0m\x1b[2m │{}\x1b[0m", if i < 4 { " " } else { "" }, width = self.w[i]);
         }
+        if self.panel_expanded() {
+            out += &format!("\r\n\x1b[2K\x1b[2m╰{}╯\x1b[0m", "─".repeat(self.w.iter().sum::<usize>() + 14));
+        }
+        out += "\r\n";
+        out += &self.footer();
         if let Some(q) = &self.search {
-            out += &format!("\x1b[{};{}H\x1b[?25h", self.view + 1, 2 + q.chars().count());
+            out += &format!("\x1b[{};{}H\x1b[?25h", self.view + 1, (2 + q.chars().count()).min(self.cols));
         } else if self.sel.is_none() || self.editing.is_some() {
             let col = cell_start(&self.w, self.focus) + view(self.focus).1;
-            out += &format!("\r\x1b[{col}C\x1b[?25h");
+            out += &format!("\x1b[{};{}H\x1b[?25h", self.field_row(), col + 1);
         }
         out
+    }
+
+    fn footer(&self) -> String {
+        let mut out = String::from("\x1b[2K");
+        let (indicator, color) = self.git_indicator();
+        let indicator: String = indicator.chars().take(self.cols).collect();
+        let room = self.cols.saturating_sub(indicator.chars().count() + 2);
+        let hint = if self.editing.is_some() { "Enter save · Tab next · Esc cancel" }
+            else if self.sel.is_some() { "Enter edit · n insert · / search · Esc back" }
+            else { "Enter next / save · Tab next · Ctrl-S sync" };
+        let hint: String = hint.chars().take(room).collect();
+        out += &format!("\x1b[2m{hint:<room$}\x1b[0m");
+        if !indicator.is_empty() {
+            let col = self.cols - indicator.chars().count() + 1;
+            out += &format!("\x1b[{col}G\x1b[{color}m{indicator}\x1b[0m");
+        }
+        out
+    }
+
+    fn resize(&mut self, h: usize, cols: usize) {
+        self.h = h;
+        self.cols = cols;
+        self.view = h.saturating_sub(if self.panel_expanded() { 6 } else { 3 });
+        if self.account.is_none() {
+            let header = ["date", "description", "debit", "credit", "balance"].map(String::from);
+            self.w = tui_widths(&header, &[], cols, self.account_w);
+        }
+        self.rebuild();
+    }
+
+    fn panel_expanded(&self) -> bool {
+        self.h >= 12
+    }
+
+    fn field_row(&self) -> usize {
+        self.view + if self.panel_expanded() { 4 } else { 2 }
+    }
+
+    fn git_indicator(&self) -> (String, u8) {
+        let activity = self.busy.get().or_else(|| self.pull_job.as_ref().map(|_| ("Fetching…", self.last_pull.unwrap_or_else(Instant::now))));
+        if let Some((label, start)) = activity {
+            let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+            return (format!("{} {label}", frames[(start.elapsed().as_millis() / 80) as usize % frames.len()]), 36);
+        }
+        if !self.in_repo { return (String::new(), 2); }
+        let (text, color) = self.git_status.get().label();
+        (text.into(), color)
+    }
+
+    /// Keep painting while git runs, retaining the existing serialization of edits
+    /// and syncs. Terminal input remains queued until the operation completes.
+    fn animate<T: Send>(&self, label: &'static str, work: impl FnOnce() -> T + Send) -> T {
+        self.busy.set(Some((label, Instant::now())));
+        let result = std::thread::scope(|scope| {
+            let job = scope.spawn(work);
+            while !job.is_finished() {
+                // A save may have changed rows before the viewport is rebuilt;
+                // repaint only the independent footer during a blocking operation.
+                #[cfg(not(test))]
+                {
+                    print!("\x1b7\x1b[{};1H{}\x1b8", self.h, self.footer());
+                    io::stdout().flush().ok();
+                }
+                std::thread::sleep(Duration::from_millis(80));
+            }
+            job.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
+        });
+        self.busy.set(None);
+        result
+    }
+
+    fn paint(&self) {
+        // Tests exercise the same operation without dumping terminal frames.
+        #[cfg(not(test))]
+        {
+            print!("{}", self.draw());
+            io::stdout().flush().ok();
+        }
+    }
+
+    fn record_git(&self, result: &Result<String, String>, full_sync: bool) {
+        let status = match result {
+            Err(_) => GitStatus::Failed,
+            Ok(note) => GitStatus::from_note(note, full_sync),
+        };
+        self.git_status.set(status);
+        if matches!(status, GitStatus::Updated | GitStatus::Current | GitStatus::Synced)
+            && (git::pending(self.dir).is_ok_and(|p| !p.is_empty()) || git::unpushed(self.dir) > 0) {
+            self.git_status.set(GitStatus::Pending);
+        }
     }
 
     // ---- fields ------------------------------------------------------------
@@ -900,7 +1041,15 @@ impl Tui {
 
     pub fn save(&self, what: &str) -> Result<String, String> {
         let (path, doc) = self.account.as_ref().ok_or("account?")?;
-        save_commit(path, doc, what)
+        let result = self.animate("Saving…", || save_commit(path, doc, what));
+        if self.in_repo {
+            if result.as_ref().is_ok_and(|note| note.is_empty()) {
+                self.git_status.set(GitStatus::Pending);
+            } else {
+                self.record_git(&result, result.as_ref().is_ok_and(|n| n == "pushed"));
+            }
+        }
+        result
     }
 
     /// Start a pull in the background, unless one is running, the tree was fetched (by
@@ -926,13 +1075,12 @@ impl Tui {
     /// Wait for the background pull, if any, and return its note.
     fn finish_pull(&mut self) -> Result<String, String> {
         let Some(job) = self.pull_job.take() else { return Ok(String::new()) };
-        if !job.is_finished() {
-            status_now("syncing…");
-        }
-        match job.join() {
+        let result = self.animate("Fetching…", move || match job.join() {
             Ok(r) => r.map(|(_, n)| n.to_string()),
             Err(_) => Err("sync failed".into()),
-        }
+        });
+        self.record_git(&result, false);
+        result
     }
 
     /// Fetch before editing (see `start_pull` for when), waiting for it to end.
@@ -1137,12 +1285,12 @@ impl Tui {
             self.msg = "not a git repository".into();
             return;
         }
-        status_now("syncing…");
-        let dir = self.dir;
-        self.msg = match git::pull(dir).and_then(|(_, n)| push_pending(dir, "").map(|(_, p)| format!("{n}; {p}"))) {
-            Ok(m) => m,
-            Err(e) => e,
-        };
+        if let Err(e) = self.finish_pull() {
+            self.msg = e;
+            return;
+        }
+        let result = self.sync_job();
+        self.msg = result.unwrap_or_else(|e| e);
         self.last_pull = Some(Instant::now());
         self.reload();
     }
@@ -1167,8 +1315,16 @@ impl Tui {
         if pending.is_empty() && pushed {
             return None;
         }
-        status_now("syncing…");
-        Some(git::pull(dir).and_then(|(_, n)| push_pending(dir, "").map(|(_, p)| format!("{n}; {p}"))))
+        Some(self.sync_job())
+    }
+
+    fn sync_job(&self) -> Result<String, String> {
+        let dir = self.dir;
+        let result = self.animate("Syncing…", move || {
+            git::pull(dir).and_then(|(_, n)| push_pending(dir, "").map(|(_, p)| format!("{n}; {p}")))
+        });
+        self.record_git(&result, true);
+        result
     }
 
     fn accept_recalc(&mut self, key: &Key) {
@@ -1407,7 +1563,7 @@ impl Tui {
                 }
             }
             Key::Click(x, y) => {
-                if y == self.h {
+                if y == self.field_row() {
                     // the fields, on the table's column grid
                     for i in 0..5 {
                         let start = cell_start(&self.w, i);
@@ -1452,11 +1608,11 @@ pub fn tui() -> Result<(), String> {
     let mut stdin = io::stdin().lock();
     let mut t = Tui::new();
     t.start_pull();
+    let mut size_checked = Instant::now();
     print!("\x1b[2J\x1b[3J");
     loop {
         print!("{}", t.draw());
         io::stdout().flush().ok();
-        t.msg.clear();
         // wait for a key; while waiting, a finished background pull gets its note shown
         let key = loop {
             match read_key(&mut stdin) {
@@ -1464,11 +1620,22 @@ pub fn tui() -> Result<(), String> {
                     t.msg = t.finish_pull().unwrap_or_else(|e| e);
                     break None;
                 }
-                Key::Idle => {}
+                Key::Idle => {
+                    if size_checked.elapsed() >= Duration::from_millis(500) {
+                        let (h, cols) = term_size();
+                        size_checked = Instant::now();
+                        if (h, cols) != (t.h, t.cols) {
+                            t.resize(h, cols);
+                            break None;
+                        }
+                    }
+                    if t.pull_job.is_some() { t.paint(); }
+                }
                 k => break Some(k),
             }
         };
         if let Some(k) = key {
+            t.msg.clear();
             if !t.handle(k) {
                 break;
             }
@@ -1495,6 +1662,86 @@ mod tests {
     use super::*;
     use crate::ledger::{cash_head, lint};
     use crate::render::{render, render_cols, wrap_words};
+
+    fn without_ansi(s: &str) -> String {
+        let mut out = String::new();
+        let mut chars = s.chars();
+        while let Some(c) = chars.next() {
+            if c == '\x1b' {
+                if chars.next() == Some('[') {
+                    for c in chars.by_ref() {
+                        if ('@'..='~').contains(&c) { break; }
+                    }
+                }
+            } else {
+                out.push(c);
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn entry_panel_layout_and_mouse_focus() {
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.account_w = 10;
+        for (h, cols) in [(24, 80), (32, 120), (10, 80), (4, 80)] {
+            t.resize(h, cols);
+            let frame = t.draw();
+            let plain = without_ansi(&frame);
+            let lines: Vec<_> = plain.split("\r\n").collect();
+            assert_eq!(lines.len(), h);
+            assert!(lines.iter().all(|l| l.chars().count() <= cols));
+            assert_eq!(plain.contains("╭─ New entry"), h >= 12);
+            assert_eq!(plain.contains("╰"), h >= 12);
+            assert!(lines[t.field_row() - 1].starts_with("│ "));
+            t.handle(Key::Click(cell_start(&t.w, 3) + 1, t.field_row()));
+            assert_eq!(t.focus, 3);
+            assert!(t.draw().contains(&format!("\x1b[{};{}H", t.field_row(), cell_start(&t.w, 3) + 1)));
+            t.handle(Key::Click(3, h)); // footer isn't an input field
+            assert_eq!(t.focus, 3);
+        }
+        t.resize(24, 80);
+        t.editing = Some(11);
+        assert!(without_ansi(&t.draw()).contains("Editing row 12"));
+        assert!(without_ansi(&t.draw()).contains("Date"));
+        t.insert = true;
+        assert!(without_ansi(&t.draw()).contains("Insert below row 12"));
+    }
+
+    #[test]
+    fn git_feedback_is_independent_and_does_not_overstate_success() {
+        for (note, full, expected) in [
+            ("up to date", false, GitStatus::Current),
+            ("fast-forwarded to the upstream", false, GitStatus::Updated),
+            ("merged the upstream", false, GitStatus::Updated),
+            ("local commits not yet pushed", false, GitStatus::Pending),
+            ("no upstream branch yet", false, GitStatus::Local),
+            ("up to date; nothing to push", true, GitStatus::Synced),
+            ("no upstream branch yet; pushed", true, GitStatus::Synced),
+            ("fetch failed; working offline; nothing to push", true, GitStatus::Offline),
+            ("up to date; push failed (offline)", true, GitStatus::Pending),
+            ("no upstream branch yet; no remote configured", true, GitStatus::Local),
+        ] {
+            assert_eq!(GitStatus::from_note(note, full), expected, "{note}");
+        }
+        let mut t = Tui::new();
+        t.resize(24, 80);
+        t.in_repo = true;
+        t.git_status.set(GitStatus::Synced);
+        t.search = Some("office".into());
+        t.msg = "No match".into();
+        let frame = t.draw();
+        assert!(frame.contains("/office   No match"));
+        assert!(frame.contains("\x1b[32m✓ Synced"));
+        t.record_git(&Err("merge conflict".into()), true);
+        assert_eq!(t.git_status.get(), GitStatus::Failed);
+        t.busy.set(Some(("Syncing…", Instant::now())));
+        assert!(t.git_indicator().0.ends_with("Syncing…"));
+        assert_eq!(t.git_indicator().1, 36);
+        t.busy.set(None);
+        assert_eq!(t.git_indicator().0, "! Sync failed");
+    }
 
     #[test]
     fn account_resolution() {
@@ -2013,7 +2260,7 @@ mod tests {
         assert_eq!((t.rows().len(), t.msg.as_str()), (7, "an amount or a balance to reach, not both"));
 
         // a click on the balance cell focuses it
-        t.handle(Key::Click(cell_start(&t.w, 4) + 1, t.h));
+        t.handle(Key::Click(cell_start(&t.w, 4) + 1, t.field_row()));
         assert_eq!(t.focus, 4);
 
         // editing row 3 (Coffee, after a balance of 150.00): a balance of 100 makes it a credit of 50
@@ -2186,7 +2433,7 @@ mod tests {
         assert_eq!(t.fields[2], "0");
         t.handle(Key::Next); // and 0 normalises to empty
         assert_eq!((t.fields[2].as_str(), t.focus), ("", 3));
-        assert!(t.draw().contains("\x1b[100m          \x1b[0m")); // empty debit, right-aligned view
+        assert!(t.draw().contains("\x1b[0m          \x1b[0m")); // empty debit, right-aligned view
 
         // the second decimal in the credit field submits, like Enter
         type_all(&mut t, "12.34");

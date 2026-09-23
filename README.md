@@ -29,6 +29,18 @@ mdl cash                       # show it (the .md is optional)
 mdl cash.md print --graph      # cash.pdf, with the balance charted
 ```
 
+## Interactive entry
+
+Run `mdl` without arguments to open the interactive ledger. The entry panel labels
+the fields and shows whether you are adding, editing, or inserting a row. The active
+field has a highlighted value and a cyan label; Enter advances or saves, and Tab
+moves between fields. Short terminals use a compact entry row.
+
+The footer keeps keyboard hints separate from git status. A spinner marks a fetch,
+save, or sync; green checkmarks show successful updates, amber marks pending pushes
+or offline work, and red marks sync errors. Ctrl-S syncs with the remote. During a
+save or manual sync, input waits until the operation finishes.
+
 ## New accounts
 
 `mdl init <file[.md]> [--lang es|en] [title...]` writes the file with a heading, a line
