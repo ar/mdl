@@ -772,6 +772,11 @@ pub mod tests {
         let j = render_json(None, &rows);
         assert!(j.contains("\"description\": \"Venta mostrador\", \"debit\": 150.00, \"credit\": 0.00, \"balance\": 150.00, \"bold\": true}"));
         assert!(j.contains("\"balance\": 0.00}")); // unflagged rows are unchanged
+        let c = render_csv(&header, &rows);
+        assert!(c.starts_with(&(header.join(",") + "\n")), "{c}");
+        assert!(c.contains(",Venta mostrador,150.00,0.00,150.00\n"), "{c}");
+        let quoted = vec![Entry { date: "2026-09-01".into(), desc: "a, \"b\"\nc".into(), debit: 1, credit: 0, balance: 1, bold: false }];
+        assert!(render_csv(&header, &quoted).ends_with("2026-09-01,\"a, \"\"b\"\"\nc\",0.01,0.00,0.01\n"));
         // `**` alone or empty is a literal description, not a flag
         let odd = DOC.replace("| Venta mostrador |", "| **** |");
         let lines: Vec<&str> = odd.lines().collect();

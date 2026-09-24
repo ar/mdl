@@ -34,8 +34,9 @@ mdl cash.md print --graph      # cash.pdf, with the balance charted
 The default display uses the interactive screen's table borders and totals, preserving the
 account's column labels. Headers, totals, and flagged entries appear bold in a
 terminal; redirected output has no terminal escape codes. Use `--markdown` for the
-original Markdown output or `--json` for JSON. `--pretty` explicitly selects the
-default format; these three output flags are mutually exclusive.
+original Markdown output, `--json` for JSON, or `--csv` for a CSV with the account's
+column labels as its header. `--pretty` explicitly selects the default format; these
+output flags are mutually exclusive.
 
 The display accepts the same periods as `print`, with or without `show`:
 

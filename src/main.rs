@@ -26,7 +26,7 @@ use std::{env, fs, process};
 
 use ledger::{Entry, add_entry, amount_arg, balance, delete_entry, edit_entry, entry_what, find_table, fmt_amount, lint, load, move_entry, period, push_pending, recalc, recalc_diff, resolve, row_index, save_commit, scoped, today};
 use print::print_pdf;
-use render::{render, render_json, render_pretty};
+use render::{render, render_csv, render_json, render_pretty};
 use tui::{scan_accounts, tui};
 
 const USAGE: &str = "\
@@ -39,7 +39,7 @@ usage: mdl [<file>[.md]] [<command> [args...]]
   mdl --help | --version
 
 Read
-  mdl <file> [show] [--pretty|--markdown|--json] [period]
+  mdl <file> [show] [--pretty|--markdown|--json|--csv] [period]
                                        the statement, with borders and totals
                                        by default; --markdown uses a GFM table
   mdl <file> print [-o <pdf>] [--graph [balance|debit|credit]...] [period]
@@ -284,7 +284,7 @@ fn run() -> Result<(), String> {
     let show = "show".to_string();
     let (cmd, rest): (&String, &[String]) = match &args[n..] {
         [] => (&show, &[]),
-        [first, ..] if ["--json", "--pretty", "--markdown", "this", "last"].contains(&first.as_str())
+        [first, ..] if ["--json", "--csv", "--pretty", "--markdown", "this", "last"].contains(&first.as_str())
             || first.as_bytes().first().is_some_and(u8::is_ascii_digit) => (&show, &args[n..]),
         [cmd, rest @ ..] => (cmd, rest),
     };
@@ -309,16 +309,19 @@ fn run() -> Result<(), String> {
         }
         "show" => {
             let json = rest.iter().any(|a| a == "--json");
+            let csv = rest.iter().any(|a| a == "--csv");
             let markdown = rest.iter().any(|a| a == "--markdown");
             let explicit_pretty = rest.iter().any(|a| a == "--pretty");
-            if json as u8 + markdown as u8 + explicit_pretty as u8 > 1 {
-                bad("show: choose only one of --pretty, --markdown, or --json");
+            if json as u8 + csv as u8 + markdown as u8 + explicit_pretty as u8 > 1 {
+                bad("show: choose only one of --pretty, --markdown, --json, or --csv");
             }
-            let pretty = !json && !markdown;
-            let words: Vec<String> = rest.iter().filter(|a| !["--json", "--pretty", "--markdown"].contains(&a.as_str())).cloned().collect();
+            let pretty = !json && !csv && !markdown;
+            let words: Vec<String> = rest.iter().filter(|a| !["--json", "--csv", "--pretty", "--markdown"].contains(&a.as_str())).cloned().collect();
             let doc = scoped(doc, &period(&words, &today())?);
             if json {
                 print!("{}", render_json(doc.title().map(|t| t[2..].trim()), &doc.rows));
+            } else if csv {
+                print!("{}", render_csv(&doc.header, &doc.rows));
             } else {
                 if let Some(t) = doc.title() {
                     println!("{}\n", if pretty { t[2..].trim() } else { t });

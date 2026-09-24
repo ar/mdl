@@ -1,4 +1,4 @@
-//! The table as text, for the file and the screen, and as JSON.
+//! The table as text, for the file and the screen, and as JSON or CSV.
 use crate::ledger::{Entry, fmt_amount, fmt_col};
 
 /// Cells as text. `marked`: flagged descriptions carry their `**` (the file); the screen
@@ -168,6 +168,23 @@ pub fn render_json(title: Option<&str>, rows: &[Entry]) -> String {
         title.map_or("null".into(), json_str),
         entries.join(",\n")
     )
+}
+
+/// RFC 4180: a cell is quoted when it holds a comma, a quote or a line break, with
+/// quotes doubled.
+fn csv_str(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
+}
+
+/// The account's own column labels as the header row, one row per entry; amounts as
+/// in JSON, so an empty debit or credit reads 0.00.
+pub fn render_csv(header: &[String], rows: &[Entry]) -> String {
+    let line = |cells: [String; 5]| cells.iter().map(|c| csv_str(c)).collect::<Vec<_>>().join(",") + "\n";
+    let mut out = line([header[0].clone(), header[1].clone(), header[2].clone(), header[3].clone(), header[4].clone()]);
+    for e in rows {
+        out += &line([e.date.clone(), e.desc.clone(), fmt_amount(e.debit), fmt_amount(e.credit), fmt_amount(e.balance)]);
+    }
+    out
 }
 
 #[cfg(test)]
