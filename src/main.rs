@@ -431,6 +431,15 @@ fn run() -> Result<(), String> {
 }
 
 fn main() {
+    // Rust ignores SIGPIPE at startup, so `mdl ... | head` panics with
+    // "failed printing to stdout". Restore the Unix default: die quietly.
+    #[cfg(unix)]
+    unsafe {
+        extern "C" {
+            fn signal(sig: i32, handler: usize) -> usize;
+        }
+        signal(13 /* SIGPIPE */, 0 /* SIG_DFL */);
+    }
     if let Err(e) = run() {
         eprintln!("{e}");
         process::exit(1);
