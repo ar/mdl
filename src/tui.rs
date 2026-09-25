@@ -740,7 +740,9 @@ impl Tui {
             if i >= 2 { amount_view(f, w, i == self.focus, cur) } else { field_view(f, w, cur) }
         };
         for i in 0..5 {
-            let style = if i == self.focus { "\x1b[7m" } else { "\x1b[0m" };
+            // Keep the terminal's background under the cursor: reverse video can
+            // give the field the same color as the terminal's configured cursor.
+            let style = if i == self.focus { "\x1b[1;4m" } else { "\x1b[0m" };
             let (shown, _) = view(i);
             out += &format!("{style}{shown:<width$}\x1b[0m\x1b[2m │{}\x1b[0m", if i < 4 { " " } else { "" }, width = self.w[i]);
         }
