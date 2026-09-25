@@ -428,7 +428,7 @@ pub fn default_commit_message(paths: &[String]) -> String {
         (1, _) => format!("mdl: update {}", accounts[0]),
         (0, 1) => format!("mdl: update {}", paths[0]),
         (0, n) => format!("mdl: update {n} files"),
-        (n, _) => format!("mdl: update {n} accounts"),
+        (n, _) => format!("mdl: update {n} accounts: {}", accounts.join(", ")),
     }
 }
 
@@ -891,7 +891,8 @@ pub mod tests {
         let v = |a: &[&str]| a.iter().map(|s| s.to_string()).collect::<Vec<_>>();
         assert_eq!(default_commit_message(&v(&[])), "mdl: no changes");
         assert_eq!(default_commit_message(&v(&["cash/ABC.md"])), "mdl: update cash/ABC");
-        assert_eq!(default_commit_message(&v(&["cash/ABC.md", "bank/XYZ.md"])), "mdl: update 2 accounts");
+        assert_eq!(default_commit_message(&v(&["cash/ABC.md", "bank/XYZ.md"])), "mdl: update 2 accounts: cash/ABC, bank/XYZ");
+        assert_eq!(default_commit_message(&v(&["cash/ABC.md", "notes.txt", "bank/XYZ.md"])), "mdl: update 2 accounts: cash/ABC, bank/XYZ");
         assert_eq!(default_commit_message(&v(&["notes.txt"])), "mdl: update notes.txt");
         assert_eq!(default_commit_message(&v(&["a.txt", "b.txt"])), "mdl: update 2 files");
     }
