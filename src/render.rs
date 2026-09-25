@@ -187,9 +187,74 @@ pub fn render_csv(header: &[String], rows: &[Entry]) -> String {
     out
 }
 
+/// Closing balances with a final total; quiet output is suitable for pipelines.
+pub fn render_balances(accounts: &[(String, i64)], format: &str, only_total: bool, styled: bool) -> String {
+    let total = fmt_amount(accounts.iter().map(|(_, amount)| amount).sum());
+    let rows: Vec<_> = accounts.iter().filter(|_| !only_total)
+        .map(|(account, amount)| (account.as_str(), fmt_amount(*amount))).collect();
+    if format == "quiet" {
+        return rows.iter().map(|(_, amount)| amount.clone() + "\n").collect::<String>() + &total + "\n";
+    }
+    if format == "json" {
+        let entries = rows.iter().map(|(account, amount)| {
+            format!("    {{\"account\": {}, \"balance\": {amount}}}", json_str(account))
+        }).collect::<Vec<_>>().join(",\n");
+        return format!("{{\"accounts\": [\n{entries}\n], \"total\": {total}}}\n");
+    }
+    if format == "csv" {
+        let mut out = String::from("Account,Balance\n");
+        for (account, amount) in &rows {
+            out += &format!("{},{amount}\n", csv_str(account));
+        }
+        return out + &format!("Total,{total}\n");
+    }
+    let markdown = format == "markdown";
+    let rows: Vec<_> = rows.iter().map(|(account, amount)| {
+        let account = account.replace('\r', "\\r").replace('\n', "\\n").replace('\t', "\\t");
+        (if markdown { account.replace('|', "\\|") } else { account }, amount)
+    }).collect();
+    let aw = rows.iter().map(|(a, _)| a.chars().count()).chain([7]).max().unwrap();
+    let bw = rows.iter().map(|(_, b)| b.len()).chain([7, total.len()]).max().unwrap();
+    let v = if markdown { "|" } else { "│" };
+    let line = |a: &str, b: &str| format!("{v} {a:<aw$} {v} {b:>bw$} {v}\n");
+    let border = |l, m, r| format!("{l}{}{m}{}{r}\n", "─".repeat(aw + 2), "─".repeat(bw + 2));
+    let emphasize = |s: String| if styled && !markdown { format!("\x1b[1m{}\x1b[0m\n", s.trim_end()) } else { s };
+    let mut out = if markdown { String::new() } else { border("┌", "┬", "┐") };
+    out += &emphasize(line("Account", "Balance"));
+    out += &if markdown {
+        format!("|{}|{}:|\n", "-".repeat(aw + 2), "-".repeat(bw + 1))
+    } else { border("├", "┼", "┤") };
+    for (account, amount) in &rows {
+        out += &line(account, amount);
+    }
+    if !markdown && !rows.is_empty() {
+        out += &border("├", "┼", "┤");
+    }
+    out += &emphasize(line("Total", &total));
+    if !markdown {
+        out += &border("└", "┴", "┘");
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn balance_formats_escape_names_and_handle_zero_and_negative_amounts() {
+        let accounts = vec![("Café | \"bank\",\nnext".into(), -125), ("empty".into(), 0)];
+        assert_eq!(render_balances(&accounts, "quiet", false, true), "-1.25\n0.00\n-1.25\n");
+        assert_eq!(render_balances(&[], "quiet", false, false), "0.00\n");
+        assert!(render_balances(&accounts, "json", false, true).contains("Café | \\\"bank\\\",\\nnext"));
+        assert!(render_balances(&accounts, "csv", false, true).contains("\"Café | \"\"bank\"\",\nnext\",-1.25\n"));
+        assert!(render_balances(&accounts, "markdown", false, true).contains("Café \\|"));
+        let pretty = render_balances(&accounts, "pretty", false, false);
+        let width = pretty.lines().next().unwrap().chars().count();
+        assert!(pretty.lines().all(|l| l.chars().count() == width));
+        assert!(render_balances(&accounts, "pretty", false, true).contains("\x1b[1m│ Total"));
+        assert_eq!(render_balances(&accounts, "csv", true, false), "Account,Balance\nTotal,-1.25\n");
+    }
 
     #[test]
     fn pretty_totals_fit_and_descriptions_remain_literal() {

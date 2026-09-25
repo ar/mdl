@@ -24,7 +24,7 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::{env, fs, process};
 
-use ledger::{Entry, add_entry, amount_arg, balance, delete_entry, edit_entry, entry_what, find_table, fmt_amount, lint, load, move_entry, period, push_pending, recalc, recalc_diff, resolve, row_index, save_commit, scoped, today};
+use ledger::{Entry, add_entry, amount_arg, balance, delete_entry, edit_entry, entry_what, find_table, lint, load, move_entry, period, push_pending, recalc, recalc_diff, resolve, row_index, save_commit, scoped, today};
 use print::print_pdf;
 use render::{render, render_csv, render_json, render_pretty};
 use tui::{scan_accounts, tui};
@@ -46,11 +46,14 @@ Read
                                        typeset to <file>.pdf, or <pdf>; --graph
                                        charts the balance, or each entry's amounts
   mdl <file> lint                      check dates, balances and #expressions
-  mdl <file> balance                   the closing balance
+  mdl <file> balance [options]         the closing balance and total
   mdl <file> <file>... show|print ...  several accounts as one (bank/*.md):
                                        merged by date, each description led
                                        by its account, one running balance
-  mdl balance [--total] <file>...      several accounts, and their sum
+  mdl balance [options] <file>...      several accounts, and their sum
+                                       --total: only the total
+                                       -q|--quiet: amounts only, one per line
+                                       --pretty|--markdown|--json|--csv
 
 Write
   mdl <file> debit  [--date D] <amount> <description...>
@@ -227,6 +230,42 @@ fn cmd_push(msg: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Both command orders share option parsing and rendering.
+fn cmd_balance(initial_files: &[String], args: &[String]) -> Result<(), String> {
+    let mut files = initial_files.to_vec();
+    let mut format = None;
+    let mut only_total = false;
+    let mut positional = false;
+    for arg in args {
+        if positional {
+            files.push(resolve(arg));
+            continue;
+        }
+        let selected = match arg.as_str() {
+            "--" => { positional = true; continue; }
+            "--total" => { only_total = true; continue; }
+            "-q" | "--quiet" => "quiet",
+            "--pretty" => "pretty",
+            "--markdown" => "markdown",
+            "--json" => "json",
+            "--csv" => "csv",
+            _ if arg.starts_with('-') => return Err(format!("balance: unknown option {arg}")),
+            _ => { files.push(resolve(arg)); continue; }
+        };
+        if format.is_some_and(|f| f != selected) {
+            return Err("balance: choose only one of --quiet, --pretty, --markdown, --json, or --csv".into());
+        }
+        format = Some(selected);
+    }
+    if files.is_empty() {
+        return Err("balance needs at least one file".into());
+    }
+    let accounts = files.iter().map(|f| Ok((f.clone(), balance(&load(f)?.rows))))
+        .collect::<Result<Vec<_>, String>>()?;
+    print!("{}", render::render_balances(&accounts, format.unwrap_or("pretty"), only_total, io::stdout().is_terminal()));
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -241,24 +280,7 @@ fn run() -> Result<(), String> {
         return Ok(());
     }
     if args.first().is_some_and(|a| a == "balance") {
-        let (only_total, files) = match &args[1..] {
-            [f, r @ ..] if f == "--total" => (true, r),
-            r => (false, r),
-        };
-        if files.is_empty() {
-            bad("balance needs at least one file")
-        }
-        let mut total = 0;
-        for f in files {
-            let f = &resolve(f);
-            let b = balance(&load(f)?.rows);
-            total += b;
-            if !only_total {
-                println!("{f}: {}", fmt_amount(b));
-            }
-        }
-        println!("{}{}", if only_total { "" } else { "total: " }, fmt_amount(total));
-        return Ok(());
+        return cmd_balance(&[], &args[1..]);
     }
     match args.as_slice() {
         [c] if c == "fetch" => return cmd_fetch(),
@@ -288,6 +310,9 @@ fn run() -> Result<(), String> {
             || first.as_bytes().first().is_some_and(u8::is_ascii_digit) => (&show, &args[n..]),
         [cmd, rest @ ..] => (cmd, rest),
     };
+    if cmd == "balance" {
+        return cmd_balance(&files, rest);
+    }
     let combined;
     let file = if files.len() == 1 {
         &files[0]
@@ -351,10 +376,6 @@ fn run() -> Result<(), String> {
             let p = period(&words, &today())?;
             let doc = scoped(doc, &p);
             println!("{}", print_pdf(&doc, file, &p, &series, out.as_deref())?);
-            return Ok(());
-        }
-        "balance" => {
-            println!("{}", fmt_amount(balance(&doc.rows)));
             return Ok(());
         }
         "recalc" => match rest {

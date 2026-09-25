@@ -38,6 +38,15 @@ original Markdown output, `--json` for JSON, or `--csv` for a CSV with the accou
 column labels as its header. `--pretty` explicitly selects the default format; these
 output flags are mutually exclusive.
 
+`mdl balance cash bank` (or `mdl cash bank balance`) shows each account's closing
+balance and their total in a bordered table. Use `--markdown`, `--json`, or `--csv`
+to export it, or `-q` / `--quiet` for just the amounts, one per line, with the total
+last and no account names or headers. This also applies to `mdl cash balance`.
+`--total` selects just the total; combine it with `-q` for a single numeric value.
+These output formats are mutually exclusive, and flags can appear before or after
+account names. JSON contains an `accounts` array of `account` / `balance` objects
+and a numeric `total`; CSV has `Account,Balance` columns and a final `Total` row.
+
 The display accepts the same periods as `print`, with or without `show`:
 
 ```
