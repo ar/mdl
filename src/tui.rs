@@ -72,6 +72,8 @@ enum Key {
     Sync,
     /// Ctrl-L: back to an empty account field.
     Clear,
+    /// Ctrl-H: posts made during this TUI session.
+    History,
     /// Cursor movement within a field; Home/End are also Ctrl-A/Ctrl-E.
     Left,
     Right,
@@ -116,7 +118,8 @@ fn read_key(stdin: &mut impl Read) -> Key {
         let Some(b) = read_byte(stdin) else { return Key::Idle };
         return match b {
             b'\r' | b'\n' => Key::Enter,
-            0x7f | 0x08 => Key::Backspace,
+            0x7f => Key::Backspace,
+            0x08 => Key::History,
             b'\t' => Key::Next,
             0x03 => Key::Esc,
             0x04 => Key::Delete,
@@ -304,6 +307,26 @@ pub fn byte_at(s: &str, i: usize) -> usize {
     s.char_indices().nth(i).map_or(s.len(), |(b, _)| b)
 }
 
+fn clipped(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("{}…", s.chars().take(width - 1).collect::<String>())
+}
+
+fn clipped_tail(s: &str, width: usize) -> String {
+    if s.chars().count() <= width {
+        return s.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    format!("…{}", s.chars().skip(s.chars().count() - width + 1).collect::<String>())
+}
+
 /// Load an account for the screen: the doc plus, when balances are stale, the prompt
 /// offering a recalc.
 fn load_for_tui(path: &str) -> Result<(Doc, Option<String>), String> {
@@ -427,6 +450,8 @@ impl GitStatus {
 //
 // Ctrl-L closes the account: empty fields, the account list rescanned, cursor in the
 // account field.
+// Ctrl-H opens a read-only list of entries added during this session, newest first.
+// Up/Down and PgUp/PgDn scroll it; Esc or Ctrl-H closes it.
 //
 // Git: the screen starts a fetch in the background (unless fetched within 15 minutes)
 // and opening an account waits for it, so the account read is the current one; Ctrl-S
@@ -471,6 +496,10 @@ struct Tui {
     /// entry follows the pointer in memory; the release saves.
     drag: Option<(usize, String)>,
     msg: String,
+    /// Snapshots of successfully posted entries, across all accounts in this session.
+    posts: Vec<(String, Entry)>,
+    /// Number of newest posts skipped in the history popup; None closes it.
+    history_scroll: Option<usize>,
     /// The search prompt, while open.
     search: Option<String>,
     /// The selection when the search began: where retyping the query searches from.
@@ -519,6 +548,8 @@ impl Tui {
             prefill: None,
             drag: None,
             msg: String::new(),
+            posts: vec![],
+            history_scroll: None,
             search: None,
             search_start: None,
             offer_recalc: false,
@@ -724,6 +755,55 @@ impl Tui {
             let col = cell_start(&self.w, self.focus) + view(self.focus).1;
             out += &format!("\x1b[{};{}H\x1b[?25h", self.field_row(), col + 1);
         }
+        if self.history_scroll.is_some() {
+            out += &self.history_popup();
+        }
+        out
+    }
+
+    fn history_height(&self) -> usize {
+        (self.posts.len().max(1) + 2).min(self.h.saturating_sub(1)).max(3)
+    }
+
+    fn history_popup(&self) -> String {
+        let height = self.history_height();
+        let width = self.cols.saturating_sub(2).min(96);
+        let inner = width - 2;
+        let first_row = (self.h - height) / 2 + 1;
+        let first_col = (self.cols - width) / 2 + 1;
+        let visible = height - 2;
+        let scroll = self.history_scroll.unwrap_or(0).min(self.posts.len().saturating_sub(visible));
+        let title = clipped(&format!(" Posts this session ({}) ", self.posts.len()), inner);
+        let mut lines = vec![format!("╭{title}{}╮", "─".repeat(inner - title.chars().count()))];
+        for i in 0..visible {
+            let content = match self.posts.iter().rev().nth(scroll + i) {
+                Some((path, e)) => {
+                    let amount = if e.debit != 0 { format!("+{}", fmt_amount(e.debit)) }
+                        else if e.credit != 0 { format!("-{}", fmt_amount(e.credit)) }
+                        else { "note".into() };
+                    let account = path.trim_end_matches(".md");
+                    if inner >= 55 {
+                        format!("{}  {}  {}  {}", clipped_tail(account, 18), e.date, amount, e.desc)
+                    } else if inner >= 36 {
+                        format!("{}  {}  {}", clipped_tail(account, 15), amount, e.desc)
+                    } else {
+                        format!("{}  {}", clipped_tail(account, inner.saturating_sub(12)), amount)
+                    }
+                }
+                None if self.posts.is_empty() => "No entries posted yet".into(),
+                None => String::new(),
+            };
+            let content = clipped(&content, inner);
+            lines.push(format!("│{content}{}│", " ".repeat(inner - content.chars().count())));
+        }
+        let hint = if inner < 48 { " Esc/Ctrl-H close · ↑/↓ scroll " }
+            else { " ↑ older  ↓ newer  PgUp/PgDn  Esc or Ctrl-H close " };
+        let hint = clipped(hint, inner);
+        lines.push(format!("╰{hint}{}╯", "─".repeat(inner - hint.chars().count())));
+        let mut out = String::from("\x1b[?25l");
+        for (i, line) in lines.iter().enumerate() {
+            out += &format!("\x1b[{};{}H\x1b[30;47m{line}\x1b[0m", first_row + i, first_col);
+        }
         out
     }
 
@@ -732,9 +812,9 @@ impl Tui {
         let (indicator, color) = self.git_indicator();
         let indicator: String = indicator.chars().take(self.cols).collect();
         let room = self.cols.saturating_sub(indicator.chars().count() + 2);
-        let hint = if self.editing.is_some() { "Enter save · Tab next · Esc cancel" }
-            else if self.sel.is_some() { "Enter edit · n insert · / search · Esc back" }
-            else { "Enter next / save · Tab next · Ctrl-S sync" };
+        let hint = if self.editing.is_some() { "Enter save · Tab next · Ctrl-H posts · Esc cancel" }
+            else if self.sel.is_some() { "Enter edit · n insert · / search · Ctrl-H posts · Esc back" }
+            else { "Enter next / save · Tab next · Ctrl-H posts · Ctrl-S sync" };
         let hint: String = hint.chars().take(room).collect();
         out += &format!("\x1b[2m{hint:<room$}\x1b[0m");
         if !indicator.is_empty() {
@@ -1135,10 +1215,11 @@ impl Tui {
             return;
         };
         let desc = self.fields[1].trim().to_string();
-        let r = amounts.and_then(|(d, c)| add_entry(&mut doc.rows, today(), d, c, desc.clone()).map(|_| (d, c)));
-        let r = r.and_then(|(d, c)| self.save(&entry_what(d, c, &desc)));
+        let r = amounts.and_then(|(d, c)| add_entry(&mut doc.rows, today(), d, c, desc.clone()).map(|i| (i, d, c)));
+        let r = r.and_then(|(i, d, c)| self.save(&entry_what(d, c, &desc)).map(|note| (i, note)));
         match r {
-            Ok(note) => {
+            Ok((i, note)) => {
+                self.record_post(i);
                 self.msg = note;
                 self.fields[1..].iter_mut().for_each(String::clear);
                 self.focus = 0;
@@ -1178,6 +1259,14 @@ impl Tui {
         self.prefill = None;
     }
 
+    fn record_post(&mut self, i: usize) {
+        if let Some((path, doc)) = &self.account {
+            if let Some(entry) = doc.rows.get(i) {
+                self.posts.push((path.clone(), entry.clone()));
+            }
+        }
+    }
+
     fn submit_edit(&mut self) {
         let Some(i) = self.editing else { return };
         let insert = self.insert;
@@ -1204,6 +1293,9 @@ impl Tui {
         match r {
             Ok(note) => {
                 let (j, verb) = if insert { (i + 1, "added") } else { (i, "updated") };
+                if insert {
+                    self.record_post(j);
+                }
                 self.msg = if note.is_empty() { format!("row {} {verb}", j + 1) } else { format!("row {} {verb}; {note}", j + 1) };
                 self.cancel_edit();
                 if insert {
@@ -1422,9 +1514,31 @@ impl Tui {
 
     // ---- keys --------------------------------------------------------------
 
+    fn history_key(&mut self, key: &Key) {
+        let page = self.history_height() - 2;
+        let max_scroll = self.posts.len().saturating_sub(page);
+        let scroll = self.history_scroll.unwrap_or(0);
+        self.history_scroll = match key {
+            Key::Esc | Key::History => None,
+            Key::Prev | Key::Wheel(-1) => Some((scroll + 1).min(max_scroll)),
+            Key::Next | Key::Wheel(1) => Some(scroll.saturating_sub(1)),
+            Key::PageUp => Some(scroll.saturating_add(page).min(max_scroll)),
+            Key::PageDown => Some(scroll.saturating_sub(page)),
+            _ => Some(scroll),
+        };
+    }
+
     /// One key; false means quit.
     fn handle(&mut self, key: Key) -> bool {
         if key == Key::Idle {
+            return true;
+        }
+        if self.history_scroll.is_some() {
+            self.history_key(&key);
+            return true;
+        }
+        if key == Key::History {
+            self.history_scroll = Some(0);
             return true;
         }
         if self.offer_recalc {
@@ -1594,7 +1708,7 @@ impl Tui {
                 (None, Some(i)) => self.start_edit(i),
                 _ => self.enter(),
             },
-            Key::Idle => {}
+            Key::Idle | Key::History => {}
         }
         if self.fields[0] != account_before {
             self.pick = (String::new(), 0); // new text: the first match is highlighted
@@ -2005,7 +2119,9 @@ mod tests {
 
     #[test]
     fn escape_sequences() {
-        let mut input: &[u8] = b"\x1b[A\x1b[1;2A\x1b[1;2B\x1b[3~\x1b[5~\x1b[<0;5;20M\x1b";
+        let mut input: &[u8] = b"\x08\x7f\x1b[A\x1b[1;2A\x1b[1;2B\x1b[3~\x1b[5~\x1b[<0;5;20M\x1b";
+        assert_eq!(read_key(&mut input), Key::History);
+        assert_eq!(read_key(&mut input), Key::Backspace);
         assert_eq!(read_key(&mut input), Key::Prev);
         assert_eq!(read_key(&mut input), Key::MoveUp);
         assert_eq!(read_key(&mut input), Key::MoveDown);
@@ -2014,6 +2130,71 @@ mod tests {
         assert_eq!(read_key(&mut input), Key::Click(5, 20));
         assert_eq!(read_key(&mut input), Key::Esc);
         assert_eq!(read_key(&mut input), Key::Idle); // nothing more to read
+    }
+
+    #[test]
+    fn session_posts_popup_tracks_adds_and_inserts() {
+        let dir = std::env::temp_dir().join(format!("mdl-tui-posts-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let cash = dir.join("cash.md");
+        let bank = dir.join("bank.md");
+        fs::write(&cash, cash_head(3)).unwrap();
+        fs::write(&bank, cash_head(3)).unwrap();
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.account = Some((cash.to_str().unwrap().into(), load(cash.to_str().unwrap()).unwrap()));
+        t.fields = ["cash".into(), "Lunch".into(), "12.00".into(), String::new(), String::new()];
+        t.focus = 2;
+        t.handle(Key::Enter);
+        assert_eq!(t.posts.len(), 1);
+        assert_eq!(t.posts[0].1.desc, "Lunch");
+
+        t.start_insert(0);
+        t.fields[1] = "Receipt".into();
+        t.fields[2] = "3.00".into();
+        t.focus = 2;
+        t.handle(Key::Enter);
+        assert_eq!(t.posts.len(), 2);
+        assert_eq!(t.posts[1].1.desc, "Receipt");
+        t.start_edit(1);
+        t.fields[1] = "Revised receipt".into();
+        t.focus = 3;
+        t.handle(Key::Enter);
+        assert_eq!(t.posts.len(), 2); // edits do not post another entry
+
+        t.clear();
+        assert_eq!(t.posts.len(), 2);
+        t.account = Some((bank.to_str().unwrap().into(), load(bank.to_str().unwrap()).unwrap()));
+        t.fields = ["bank".into(), "Transfer".into(), "5.00".into(), String::new(), String::new()];
+        t.focus = 2;
+        t.handle(Key::Enter);
+        assert_eq!(t.posts.len(), 3);
+        t.fields[1].clear();
+        t.fields[2] = "1.00".into();
+        t.focus = 2;
+        t.handle(Key::Enter);
+        assert_eq!(t.posts.len(), 3); // rejected entries are absent
+        t.handle(Key::History);
+        let popup = without_ansi(&t.history_popup());
+        assert!(popup.find("Transfer").unwrap() < popup.find("Receipt").unwrap());
+        assert!(popup.find("Receipt").unwrap() < popup.find("Lunch").unwrap());
+        assert!(popup.contains("bank"));
+        assert!(popup.contains("cash"));
+        let fields = t.fields.clone();
+        t.handle(Key::Char('x'));
+        assert_eq!(t.fields, fields); // modal keys never edit the form
+        t.resize(6, 30);
+        t.posts.extend([t.posts[0].clone(), t.posts[0].clone()]);
+        t.handle(Key::Prev);
+        assert_eq!(t.history_scroll, Some(1));
+        t.handle(Key::PageUp);
+        assert_eq!(t.history_scroll, Some(2));
+        t.handle(Key::Next);
+        assert_eq!(t.history_scroll, Some(1));
+        t.handle(Key::Esc);
+        assert!(t.history_scroll.is_none());
+        assert_eq!(t.fields, fields);
+        let _ = fs::remove_dir_all(dir);
     }
 
     #[test]

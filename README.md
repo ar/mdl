@@ -68,6 +68,11 @@ the fields and shows whether you are adding, editing, or inserting a row. The ac
 field has a highlighted value and a cyan label; Enter advances or saves, and Tab
 moves between fields. Short terminals use a compact entry row.
 
+Ctrl-H opens a read-only list of entries posted in the current TUI session, across
+accounts, newest first. Up/Down or PgUp/PgDn scroll the list; Esc or Ctrl-H closes it.
+The list includes new entries and inserted rows, including notes, and disappears when
+the session ends.
+
 The footer keeps keyboard hints separate from git status. A spinner marks a fetch,
 save, or sync; green checkmarks show successful updates, amber marks pending pushes
 or offline work, and red marks sync errors. Ctrl-S syncs with the remote. During a
