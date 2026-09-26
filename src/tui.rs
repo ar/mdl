@@ -508,6 +508,8 @@ struct Tui {
     offer_recalc: bool,
     dir: &'static Path,
     in_repo: bool,
+    /// A command-line account stays open for the entire session.
+    fixed_account: bool,
     /// Account scope and save policy, refreshed when opening an account.
     account_git: bool,
     autocommit: bool,
@@ -558,6 +560,7 @@ impl Tui {
             offer_recalc: false,
             dir,
             in_repo: git::is_repo(dir),
+            fixed_account: false,
             account_git: true,
             autocommit: false,
             last_pull: None,
@@ -573,7 +576,13 @@ impl Tui {
     }
 
     fn stem(&self) -> String {
-        self.account.as_ref().map(|(p, _)| p.trim_end_matches(".md").to_string()).unwrap_or_default()
+        self.account.as_ref().map(|(p, _)| {
+            if self.fixed_account {
+                Path::new(p).file_stem().unwrap_or_default().to_string_lossy().into_owned()
+            } else {
+                p.trim_end_matches(".md").to_string()
+            }
+        }).unwrap_or_default()
     }
 
     // ---- statement viewport ------------------------------------------------
@@ -910,6 +919,9 @@ impl Tui {
     /// and one entered with a value in it is "selected": Backspace clears it, typing
     /// replaces it.
     fn set_focus(&mut self, f: usize) {
+        if self.fixed_account && self.editing.is_none() && f == 0 {
+            return;
+        }
         let from = self.focus;
         let mut f = f;
         if from >= 2 && from != f {
@@ -954,7 +966,7 @@ impl Tui {
     /// is empty or in use as a date (an edit).
     fn completions(&self) -> Vec<String> {
         let q = self.fields[0].trim();
-        if self.editing.is_some() || q.is_empty() {
+        if self.fixed_account || self.editing.is_some() || q.is_empty() {
             return vec![];
         }
         account_matches(q, &self.accounts)
@@ -1189,6 +1201,10 @@ impl Tui {
     }
 
     fn open(&mut self) {
+        if self.fixed_account {
+            self.set_focus(1);
+            return;
+        }
         let id = self.fields[0].trim().to_string();
         let mut opened = self.account.is_some();
         if !id.is_empty() && self.stem() != id {
@@ -1227,10 +1243,10 @@ impl Tui {
                 return Err(pulled.err().unwrap_or(e));
             }
         };
-        self.fields[0] = path.trim_end_matches(".md").to_string();
         self.offer_recalc = offer.is_some();
         self.msg = offer.unwrap_or_else(|| pulled.unwrap_or_else(|e| e));
         self.account = Some((path.to_string(), doc));
+        self.fields[0] = self.stem();
         self.sel = None;
         self.editing = None;
         self.focus = 1;
@@ -1255,9 +1271,9 @@ impl Tui {
                 self.record_post(i);
                 self.msg = note;
                 self.fields[1..].iter_mut().for_each(String::clear);
-                self.focus = 0;
+                self.focus = usize::from(self.fixed_account);
                 self.cur = usize::MAX;
-                self.select = true;
+                self.select = !self.fixed_account;
                 self.sel = None;
                 self.prefill = None;
                 self.rebuild();
@@ -1287,7 +1303,7 @@ impl Tui {
         self.editing = None;
         self.insert = false;
         self.fields = [self.stem(), String::new(), String::new(), String::new(), String::new()];
-        self.focus = 0;
+        self.focus = usize::from(self.fixed_account);
         self.cur = usize::MAX;
         self.prefill = None;
     }
@@ -1397,6 +1413,9 @@ impl Tui {
                 }
                 self.editing = None;
                 self.fields = [self.stem(), String::new(), String::new(), String::new(), String::new()];
+                if self.fixed_account {
+                    self.focus = self.focus.max(1);
+                }
                 let n = self.rows().len();
                 self.sel = self.sel.filter(|_| n > 0).map(|i| i.min(n - 1));
                 self.rebuild();
@@ -1470,6 +1489,13 @@ impl Tui {
     /// Ctrl-L: close the account and start over with an empty account field; the
     /// account list is rescanned on the way.
     fn clear(&mut self) {
+        if self.fixed_account {
+            self.cancel_edit();
+            self.select = false;
+            self.sel = None;
+            self.search = None;
+            return;
+        }
         self.account = None;
         self.account_git = true;
         self.autocommit = false;
@@ -1656,7 +1682,7 @@ impl Tui {
                 } else if let Some(i) = self.sel {
                     self.select_row(i.saturating_sub(1));
                 } else if self.focus == 0 && self.account.is_none() && self.cycle_pick(false) {
-                } else if self.focus > 0 {
+                } else if self.focus > usize::from(self.fixed_account) {
                     self.set_focus(self.focus - 1);
                 } else if n > 0 {
                     self.select_row(n - 1);
@@ -1760,6 +1786,7 @@ pub fn tui(file: Option<&str>) -> Result<(), String> {
     let raw = Raw::enter().ok_or("not a terminal")?;
     let mut stdin = io::stdin().lock();
     let mut t = Tui::new();
+    t.fixed_account = file.is_some();
     if file.is_none() {
         t.start_pull();
     }
@@ -1836,6 +1863,55 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn command_line_account_stays_fixed() {
+        let dir = std::env::temp_dir().join(format!("mdl-tui-fixed-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sample.md");
+        let path = file.to_str().unwrap();
+        fs::write(&file, cash_head(3)).unwrap();
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.fixed_account = true;
+        t.resize(24, 80);
+        t.open_path(path).unwrap();
+        assert_eq!(t.fields[0], "sample");
+        assert!(t.completions().is_empty());
+        let frame = without_ansi(&t.draw());
+        let field = frame.split("\r\n").nth(t.field_row() - 1).unwrap();
+        assert!(field.starts_with("│ sample"));
+        t.handle(Key::Click(cell_start(&t.w, 0) + 1, t.field_row()));
+        assert_eq!(t.focus, 1);
+        t.handle(Key::Char('x'));
+        assert_eq!(t.fields[0], "sample");
+        assert_eq!(t.fields[1], "x");
+        t.handle(Key::Prev); // Up from description selects the last entry
+        assert_eq!(t.sel, Some(2));
+        t.handle(Key::Enter);
+        t.handle(Key::Prev); // the date remains editable
+        assert_eq!(t.focus, 0);
+        assert_ne!(t.fields[0], "sample");
+        t.handle(Key::Esc);
+        assert_eq!((t.focus, t.fields[0].as_str()), (1, "sample"));
+        t.handle(Key::Esc); // leave the row selection
+        t.handle(Key::Char('n'));
+        t.handle(Key::Enter);
+        t.handle(Key::Char('1'));
+        t.handle(Key::Enter); // save a new entry to the original path
+        assert_eq!(load(path).unwrap().rows.len(), 4);
+        assert_eq!((t.focus, t.fields[0].as_str()), (1, "sample"));
+        t.handle(Key::Char('x'));
+        t.handle(Key::Clear);
+        assert_eq!(t.account.as_ref().unwrap().0, path);
+        assert_eq!((t.focus, t.fields[0].as_str(), t.fields[1].as_str()), (1, "sample", ""));
+        assert!(!t.git_enabled());
+        t.start_edit(0);
+        t.set_focus(0);
+        t.reload();
+        assert_eq!((t.focus, t.fields[0].as_str()), (1, "sample"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

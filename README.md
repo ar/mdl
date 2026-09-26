@@ -65,6 +65,9 @@ entries within that period. Output flags may appear before or after the period.
 
 Run `mdl` without arguments to open the interactive ledger, or `mdl cash edit` to
 open it with a specific account loaded and the description field ready for entry.
+This session stays on that account: the account field shows only its filename
+without `.md` and cannot be changed. Ctrl-L clears the entry while keeping the
+account open. Run plain `mdl` to switch between accounts.
 The `.md` extension is optional. Supplying row arguments to `edit` still edits that
 row directly from the command line.
 
