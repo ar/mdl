@@ -63,7 +63,12 @@ entries within that period. Output flags may appear before or after the period.
 
 ## Interactive entry
 
-Run `mdl` without arguments to open the interactive ledger. The entry panel labels
+Run `mdl` without arguments to open the interactive ledger, or `mdl cash edit` to
+open it with a specific account loaded and the description field ready for entry.
+The `.md` extension is optional. Supplying row arguments to `edit` still edits that
+row directly from the command line.
+
+The entry panel labels
 the fields and shows whether you are adding, editing, or inserting a row. The active
 field has a highlighted value and a cyan label; Enter advances or saves, and Tab
 moves between fields. Short terminals use a compact entry row.

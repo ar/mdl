@@ -56,6 +56,7 @@ Read
                                        --pretty|--markdown|--json|--csv
 
 Write
+  mdl <file> edit                      interactive screen with this account open
   mdl <file> debit  [--date D] <amount> <description...>
   mdl <file> credit [--date D] <amount> <description...>
   mdl <file> note   [--date D] <description...>
@@ -269,7 +270,7 @@ fn cmd_balance(initial_files: &[String], args: &[String]) -> Result<(), String> 
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
-        return tui();
+        return tui(None);
     }
     if args.first().is_some_and(|a| a == "--help" || a == "-h") {
         print!("{USAGE}");
@@ -324,6 +325,9 @@ fn run() -> Result<(), String> {
     } else {
         bad(&format!("{cmd} takes one account; only show and print combine several"))
     };
+    if cmd == "edit" && rest.is_empty() {
+        return tui(Some(file));
+    }
     let mut doc = if files.len() == 1 { load(file)? } else { ledger::combine(&files)? };
     let what: String;
 

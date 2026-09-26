@@ -1181,24 +1181,8 @@ impl Tui {
                 Some(name) if !self.exact_account() => Ok(format!("{name}.md")),
                 _ => resolve_account(&id, &self.accounts),
             };
-            match target {
-                Ok(path) => {
-                    let pulled = self.pull_if_due();
-                    match load_for_tui(&path) {
-                        Ok((doc, offer)) => {
-                            self.fields[0] = path.trim_end_matches(".md").to_string();
-                            self.offer_recalc = offer.is_some();
-                            self.msg = offer.unwrap_or_else(|| pulled.clone().unwrap_or_else(|e| e));
-                            self.account = Some((path, doc));
-                            self.sel = None;
-                            self.editing = None;
-                            self.rebuild();
-                            opened = true;
-                        }
-                        // a failed merge leaves markers the parser refuses: say why
-                        Err(e) => self.msg = pulled.err().unwrap_or(e),
-                    }
-                }
+            match target.and_then(|path| self.open_path(&path)) {
+                Ok(()) => opened = true,
                 Err(e) => self.msg = e,
             }
         }
@@ -1206,6 +1190,23 @@ impl Tui {
             self.focus = 1;
             self.cur = usize::MAX;
         }
+    }
+
+    /// Open an exact path, including accounts supplied on the command line.
+    fn open_path(&mut self, path: &str) -> Result<(), String> {
+        let pulled = self.pull_if_due();
+        // A failed merge leaves markers the parser refuses: say why.
+        let (doc, offer) = load_for_tui(path).map_err(|e| pulled.clone().err().unwrap_or(e))?;
+        self.fields[0] = path.trim_end_matches(".md").to_string();
+        self.offer_recalc = offer.is_some();
+        self.msg = offer.unwrap_or_else(|| pulled.unwrap_or_else(|e| e));
+        self.account = Some((path.to_string(), doc));
+        self.sel = None;
+        self.editing = None;
+        self.focus = 1;
+        self.cur = usize::MAX;
+        self.rebuild();
+        Ok(())
     }
 
     fn add(&mut self) {
@@ -1719,13 +1720,20 @@ impl Tui {
     }
 }
 
-pub fn tui() -> Result<(), String> {
+pub fn tui(file: Option<&str>) -> Result<(), String> {
+    // Report invalid accounts before changing the terminal or starting a fetch.
+    if let Some(path) = file {
+        load_for_tui(path)?;
+    }
     let raw = Raw::enter().ok_or("not a terminal")?;
     let mut stdin = io::stdin().lock();
     let mut t = Tui::new();
     t.start_pull();
     let mut size_checked = Instant::now();
     print!("\x1b[2J\x1b[3J");
+    if let Some(path) = file {
+        t.open_path(path)?;
+    }
     loop {
         print!("{}", t.draw());
         io::stdout().flush().ok();
@@ -1794,6 +1802,31 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn opens_an_explicit_account_path() {
+        let dir = std::env::temp_dir().join(format!("mdl-tui-open-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("outside.md");
+        let path = file.to_str().unwrap();
+        let mut doc = load("cash.md").unwrap();
+        doc.rows[0].balance += 1;
+        fs::write(&file, render(&doc.header, &doc.rows)).unwrap();
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.accounts.clear(); // explicit paths need not be in the scanned account tree
+        t.open_path(path).unwrap();
+        assert_eq!(t.account.as_ref().unwrap().0, path);
+        assert_eq!(t.fields[0], path.trim_end_matches(".md"));
+        assert_eq!(t.focus, 1);
+        assert_eq!(t.cur(), 0);
+        assert_eq!(t.rows().len(), doc.rows.len());
+        assert_eq!(t.rows()[0].balance, doc.rows[0].balance);
+        assert!(t.offer_recalc);
+        assert!(t.msg.contains("Enter: recalc and save"));
+        assert!(!t.lines.is_empty());
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
