@@ -47,6 +47,22 @@ pub fn is_repo(dir: &Path) -> bool {
     git(dir, &["rev-parse", "--git-dir"]).map(|o| o.status.success()).unwrap_or(false)
 }
 
+/// Only accounts inside this working tree and this working directory participate
+/// in its Git operations. Resolve symlinks before checking the boundary.
+pub fn account_in_tree(dir: &Path, file: &str) -> bool {
+    let (Ok(dir), Ok(file)) = (dir.canonicalize(), Path::new(file).canonicalize()) else { return false };
+    if !file.starts_with(&dir) {
+        return false;
+    }
+    let Some(parent) = file.parent() else { return false };
+    let root = |p: &Path| git_ok(p, &["rev-parse", "--show-toplevel"])
+        .ok().and_then(|s| Path::new(&s).canonicalize().ok());
+    match (root(&dir), root(parent)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
 /// `git config mdl.autocommit true` in the account repository: every save commits
 /// the file and pushes best-effort.
 pub fn autocommit(dir: &Path) -> bool {

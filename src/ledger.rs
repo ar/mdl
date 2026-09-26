@@ -414,7 +414,7 @@ impl Doc {
 pub fn save_commit(file: &str, doc: &Doc, what: &str) -> Result<String, String> {
     doc.save(file)?;
     let dir = Path::new(".");
-    if !git::is_repo(dir) || !git::autocommit(dir) {
+    if !git::account_in_tree(dir, file) || !git::autocommit(dir) {
         return Ok(String::new());
     }
     git::commit_push(dir, file, &format!("mdl: {} {what}", file.trim_end_matches(".md")))

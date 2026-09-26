@@ -83,6 +83,12 @@ save, or sync; green checkmarks show successful updates, amber marks pending pus
 or offline work, and red marks sync errors. Ctrl-S syncs with the remote. During a
 save or manual sync, input waits until the operation finishes.
 
+Git is disabled for accounts outside the working directory, outside its Git
+repository, or reached through a symlink that points outside it. These accounts
+save directly without fetching, committing, or syncing on exit. Git scope and
+autocommit settings are checked when an account opens, not on each keystroke or
+local save.
+
 ## New accounts
 
 `mdl init <file[.md]> [--lang es|en] [title...]` writes the file with a heading, a line

@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use std::{fs, process};
 
 use crate::git;
-use crate::ledger::{Doc, Entry, add_entry, delete_entry, desc_expr, edit_entry, entry_what, fmt_amount, fmt_col, insert_entry, load, move_entry, parse_amount, push_pending, recalc, recalc_diff, save_commit, today};
+use crate::ledger::{Doc, Entry, add_entry, delete_entry, desc_expr, edit_entry, entry_what, fmt_amount, fmt_col, insert_entry, load, move_entry, parse_amount, push_pending, recalc, recalc_diff, today};
 use crate::render::{grid, natural_widths, render_lines, totals};
 
 fn stty(args: &[&str]) -> Option<String> {
@@ -508,6 +508,9 @@ struct Tui {
     offer_recalc: bool,
     dir: &'static Path,
     in_repo: bool,
+    /// Account scope and save policy, refreshed when opening an account.
+    account_git: bool,
+    autocommit: bool,
     last_pull: Option<Instant>,
     /// The pull running in the background, started when the screen opens (and by
     /// `pull_if_due`); opening an account joins it first.
@@ -555,6 +558,8 @@ impl Tui {
             offer_recalc: false,
             dir,
             in_repo: git::is_repo(dir),
+            account_git: true,
+            autocommit: false,
             last_pull: None,
             pull_job: None,
             pick: (String::new(), 0),
@@ -846,12 +851,12 @@ impl Tui {
     }
 
     fn git_indicator(&self) -> (String, u8) {
+        if !self.git_enabled() { return (String::new(), 2); }
         let activity = self.busy.get().or_else(|| self.pull_job.as_ref().map(|_| ("Fetching…", self.last_pull.unwrap_or_else(Instant::now))));
         if let Some((label, start)) = activity {
             let frames = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
             return (format!("{} {label}", frames[(start.elapsed().as_millis() / 80) as usize % frames.len()]), 36);
         }
-        if !self.in_repo { return (String::new(), 2); }
         let (text, color) = self.git_status.get().label();
         (text.into(), color)
     }
@@ -1123,15 +1128,25 @@ impl Tui {
 
     pub fn save(&self, what: &str) -> Result<String, String> {
         let (path, doc) = self.account.as_ref().ok_or("account?")?;
-        let result = self.animate("Saving…", || save_commit(path, doc, what));
-        if self.in_repo {
-            if result.as_ref().is_ok_and(|note| note.is_empty()) {
-                self.git_status.set(GitStatus::Pending);
-            } else {
-                self.record_git(&result, result.as_ref().is_ok_and(|n| n == "pushed"));
-            }
+        doc.save(path)?;
+        if !self.git_enabled() {
+            return Ok(String::new());
+        }
+        let result = if self.autocommit {
+            self.animate("Saving…", || git::commit_push(self.dir, path, &format!("mdl: {} {what}", path.trim_end_matches(".md"))))
+        } else {
+            Ok(String::new())
+        };
+        if result.as_ref().is_ok_and(|note| note.is_empty()) {
+            self.git_status.set(GitStatus::Pending);
+        } else {
+            self.record_git(&result, result.as_ref().is_ok_and(|n| n == "pushed"));
         }
         result
+    }
+
+    fn git_enabled(&self) -> bool {
+        self.in_repo && self.account_git
     }
 
     /// Start a pull in the background, unless one is running, the tree was fetched (by
@@ -1140,11 +1155,13 @@ impl Tui {
     fn start_pull(&mut self) {
         const SYNC_EVERY: u64 = 15 * 60;
         let tried = self.last_pull.is_some_and(|t| t.elapsed().as_secs() < SYNC_EVERY);
-        let fetched = git::fetched_ago(self.dir).is_some_and(|d| d.as_secs() < SYNC_EVERY);
-        if !self.in_repo || self.pull_job.is_some() || tried || fetched {
+        if !self.git_enabled() || self.pull_job.is_some() || tried {
             return;
         }
         self.last_pull = Some(Instant::now());
+        if git::fetched_ago(self.dir).is_some_and(|d| d.as_secs() < SYNC_EVERY) {
+            return;
+        }
         let dir = self.dir;
         self.pull_job = Some(std::thread::spawn(move || git::pull(dir)));
     }
@@ -1194,9 +1211,22 @@ impl Tui {
 
     /// Open an exact path, including accounts supplied on the command line.
     fn open_path(&mut self, path: &str) -> Result<(), String> {
+        load_for_tui(path)?;
+        // An earlier account's fetch must finish before changing scope. A fetch
+        // error must not prevent opening a local account.
+        let _ = self.finish_pull();
+        let previous = (self.account_git, self.autocommit);
+        self.account_git = self.in_repo && git::account_in_tree(self.dir, path);
+        self.autocommit = self.git_enabled() && git::autocommit(self.dir);
         let pulled = self.pull_if_due();
         // A failed merge leaves markers the parser refuses: say why.
-        let (doc, offer) = load_for_tui(path).map_err(|e| pulled.clone().err().unwrap_or(e))?;
+        let (doc, offer) = match load_for_tui(path) {
+            Ok(loaded) => loaded,
+            Err(e) => {
+                (self.account_git, self.autocommit) = previous;
+                return Err(pulled.err().unwrap_or(e));
+            }
+        };
         self.fields[0] = path.trim_end_matches(".md").to_string();
         self.offer_recalc = offer.is_some();
         self.msg = offer.unwrap_or_else(|| pulled.unwrap_or_else(|e| e));
@@ -1376,8 +1406,8 @@ impl Tui {
     }
 
     fn sync(&mut self) {
-        if !self.in_repo {
-            self.msg = "not a git repository".into();
+        if !self.git_enabled() {
+            self.msg = "git disabled for this account".into();
             return;
         }
         if let Err(e) = self.finish_pull() {
@@ -1395,7 +1425,7 @@ impl Tui {
     /// round trip. A background pull still running is waited for first, so two git
     /// operations never overlap. None: nothing was done.
     fn quit_sync(&mut self) -> Option<Result<String, String>> {
-        if !self.in_repo {
+        if !self.git_enabled() {
             return None;
         }
         let dir = self.dir;
@@ -1441,6 +1471,8 @@ impl Tui {
     /// account list is rescanned on the way.
     fn clear(&mut self) {
         self.account = None;
+        self.account_git = true;
+        self.autocommit = false;
         self.fields = Default::default();
         self.focus = 0;
         self.cur = usize::MAX;
@@ -1728,7 +1760,9 @@ pub fn tui(file: Option<&str>) -> Result<(), String> {
     let raw = Raw::enter().ok_or("not a terminal")?;
     let mut stdin = io::stdin().lock();
     let mut t = Tui::new();
-    t.start_pull();
+    if file.is_none() {
+        t.start_pull();
+    }
     let mut size_checked = Instant::now();
     print!("\x1b[2J\x1b[3J");
     if let Some(path) = file {
@@ -1802,6 +1836,68 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn git_scope_follows_the_account() {
+        let base = std::env::temp_dir().join(format!("mdl-tui-scope-{}", std::process::id()));
+        let tree = base.join("repo");
+        let work = tree.join("accounts");
+        fs::create_dir_all(&work).unwrap();
+        let git = |dir: &Path, args: &[&str]| {
+            let output = process::Command::new("git").arg("-C").arg(dir).args(args).output().unwrap();
+            assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        };
+        git(&tree, &["init", "--quiet"]);
+        git(&tree, &["config", "mdl.autocommit", "true"]);
+        let inside = work.join("inside.md");
+        let sibling = tree.join("sibling.md");
+        let outside = base.join("outside.md");
+        let nested = work.join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        git(&nested, &["init", "--quiet"]);
+        let nested_file = nested.join("nested.md");
+        for file in [&inside, &sibling, &outside, &nested_file] {
+            fs::write(file, cash_head(3)).unwrap();
+        }
+        let mut t = Tui::new();
+        t.dir = Box::leak(work.into_boxed_path());
+        t.in_repo = true;
+        t.last_pull = Some(Instant::now()); // no network needed for this test
+        t.open_path(inside.to_str().unwrap()).unwrap();
+        assert!(t.git_enabled());
+        assert!(t.autocommit);
+        for file in [&outside, &sibling, &nested_file] {
+            t.open_path(file.to_str().unwrap()).unwrap();
+            assert!(!t.git_enabled());
+            assert!(!t.autocommit);
+            t.sel = Some(1);
+            t.handle(Key::MoveDown);
+            assert_eq!(t.sel, Some(2));
+            assert_eq!(load(file.to_str().unwrap()).unwrap().rows[2].desc, t.rows()[2].desc);
+            assert!(t.git_indicator().0.is_empty());
+            assert!(t.pull_job.is_none());
+            assert!(t.quit_sync().is_none());
+            t.sync();
+            assert_eq!(t.msg, "git disabled for this account");
+        }
+        #[cfg(unix)]
+        {
+            let link = t.dir.join("linked.md");
+            std::os::unix::fs::symlink(&outside, &link).unwrap();
+            t.open_path(link.to_str().unwrap()).unwrap();
+            assert!(!t.git_enabled());
+        }
+        t.open_path(inside.to_str().unwrap()).unwrap();
+        assert!(t.git_enabled());
+        assert!(t.autocommit);
+        // A working directory without Git also leaves the file local.
+        t.dir = Box::leak(base.clone().into_boxed_path());
+        t.in_repo = false;
+        t.open_path(outside.to_str().unwrap()).unwrap();
+        assert!(!t.git_enabled());
+        assert_eq!(t.save("local save").unwrap(), "");
+        fs::remove_dir_all(base).unwrap();
     }
 
     #[test]
