@@ -63,13 +63,17 @@ entries within that period. Output flags may appear before or after the period.
 
 ## Interactive entry
 
-Run `mdl` without arguments to open the interactive ledger, or `mdl cash edit` to
+Run `mdl` without arguments to open the interactive ledger, or `mdl edit cash` to
 open it with a specific account loaded and the description field ready for entry.
+If the file is missing, it is created with the default English ledger table and a
+zero opening balance dated today. If the file exists without a ledger table, the
+table is appended, preserving its text. Existing ledgers are opened as they are.
 This session stays on that account: the account field shows only its filename
 without `.md` and cannot be changed. Ctrl-L clears the entry while keeping the
 account open. Run plain `mdl` to switch between accounts.
-The `.md` extension is optional. Supplying row arguments to `edit` still edits that
-row directly from the command line.
+The `.md` extension is optional. `mdl cash edit` remains an alias. The command
+`mdl cash edit <row> <date> <debit|-> <credit|-> <description...>` still edits a row
+directly from the command line.
 
 The entry panel labels
 the fields and shows whether you are adding, editing, or inserting a row. The active

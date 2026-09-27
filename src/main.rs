@@ -55,7 +55,9 @@ Read
                                        --pretty|--markdown|--json|--csv
 
 Write
-  mdl <file> edit                      interactive screen with this account open
+  mdl edit <file>                      interactive screen with this account open;
+                                       creates the file or appends a table if needed
+  mdl <file> edit                      alias for mdl edit <file>
   mdl <file> debit  [--date D] <amount> <description...>
   mdl <file> credit [--date D] <amount> <description...>
   mdl <file> note   [--date D] <description...>
@@ -125,6 +127,39 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Prepare an explicit interactive account, preserving existing prose and tables.
+fn prepare_edit(file: &str) -> Result<String, String> {
+    let mut file = resolve(file);
+    if !Path::new(&file).exists() && !file.ends_with(".md") {
+        file.push_str(".md");
+    }
+    let existing = match fs::read_to_string(&file) {
+        Ok(text) => Some(text),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+        Err(e) => return Err(format!("{file}: {e}")),
+    };
+    if let Some(text) = &existing {
+        let lines: Vec<&str> = text.lines().collect();
+        if lines.iter().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ")) {
+            return Err(format!("{file}: unresolved merge conflict"));
+        }
+        if find_table(&lines).is_ok() {
+            // A malformed ledger is an error, not a reason to append another table.
+            load(&file)?;
+            return Ok(file);
+        }
+    }
+    let title = Path::new(&file).file_stem().unwrap_or_default().to_string_lossy();
+    let text = init_text(existing.as_deref(), &title, "en", &today())?;
+    fs::write(&file, text).map_err(|e| format!("{file}: {e}"))?;
+    Ok(file)
+}
+
+fn cmd_edit(file: &str) -> Result<(), String> {
+    let file = prepare_edit(file)?;
+    tui(Some(&file))
 }
 
 /// The file `init` writes: the template for a new one, or `existing` with the table
@@ -285,6 +320,10 @@ fn run() -> Result<(), String> {
         [c] if c == "fetch" => return cmd_fetch(),
         [c, m @ ..] if c == "push" => return cmd_push(m),
         [c, r @ ..] if c == "init" => return cmd_init(r),
+        [c, rest @ ..] if c == "edit" => {
+            let [file] = rest else { bad("edit needs exactly one file name") };
+            return cmd_edit(file);
+        }
         [c, m @ ..] if c == "sync" => {
             let (changed, note) = git::pull(repo_dir()?)?;
             eprintln!("{note}");
@@ -324,7 +363,7 @@ fn run() -> Result<(), String> {
         bad(&format!("{cmd} takes one account; only show and print combine several"))
     };
     if cmd == "edit" && rest.is_empty() {
-        return tui(Some(file));
+        return cmd_edit(file);
     }
     let mut doc = if files.len() == 1 { load(file)? } else { ledger::combine(&files)? };
     let what: String;
