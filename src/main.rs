@@ -5,10 +5,9 @@
 //! yours (`init` writes them in English, or Spanish with `--lang es`; nothing reads
 //! them back) and are preserved on rewrite. Empty amount cells
 //! mean 0; a row with neither amount is a note (a dated remark) and leaves the
-//! balance as it was. Amounts are i64 cents; balance = Σ debit − Σ credit. A description may
-//! start with `#` and a computation (`#1000*40.50 currency exchange`, `#100+200+50 varios`),
-//! its value being the row's effect on the balance (negative: a credit); `lint`
-//! checks it against the row, and the TUI fills the amount from it.
+//! balance as it was. Amounts are i64 cents; balance = Σ debit − Σ credit. Descriptions
+//! contain plain text. Amount inputs accept arithmetic as a calculation aid; only
+//! the resulting numbers are stored.
 //!
 //! Git: `fetch`, `push` and `sync` work on the current directory (the account tree),
 //! scoped to it. With `git config mdl.autocommit true` in that repository every
@@ -45,7 +44,7 @@ Read
   mdl <file> print [-o <pdf>] [--graph [balance|debit|credit]...] [period]
                                        typeset to <file>.pdf, or <pdf>; --graph
                                        charts the balance, or each entry's amounts
-  mdl <file> lint                      check dates, balances and #expressions
+  mdl <file> lint                      check dates and balances
   mdl <file> balance [options]         the closing balance and total
   mdl <file> <file>... show|print ...  several accounts as one (bank/*.md):
                                        merged by date, each description led
@@ -81,9 +80,8 @@ period      YYYY-MM [YYYY-MM] | this [N] | last [N]: months; this N ends with
 --date D    D is YYYY-MM-DD, today by default; a date before the last row
             inserts the entry in date order, after the rows on that day
 amount      1234.50, or a computation: 100+200+50, 1000*40.50
-#expr       a description may start with one (#1000*40.50 exchange): its
-            value is the row's amount, negative for a credit; lint checks
-            it, and the interactive screen fills the amount from it
+            in the interactive screen, calculate directly in Debit, Credit or
+            Balance; Enter evaluates and advances/saves, Tab evaluates and moves
 ";
 
 /// A command line that does not parse: one line saying what is missing, and where the

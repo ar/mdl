@@ -143,23 +143,17 @@ mdl cash.md debit 100+200+50 Three invoices
 mdl cash.md credit 1000*40.50 Dollars bought
 ```
 
-A description may carry its own computation: one that starts with `#` followed by an
-expression with at least one operator, such as `#1000*40.50 currency exchange` or
-`#100+200+50 sundries`. Its value is the row's effect on the balance: positive is a
-debit, negative (`#-1000*40.50 USD sale`) a credit. The expression stays in the
-description, so the row shows where its amount came from. `lint` checks that each
-such description agrees with its row, and in the interactive screen Enter from the
-description fills the amount field with the value, selected, ready to accept with
-another Enter or to type over. Without the `#` a description is prose however it
-looks (`2-3 people`, `1000*40.50 exchange`), and so is `#123 invoice`: a `#` with just
-a number.
+In the interactive screen, type calculations directly into Debit, Credit, or
+Balance, for example `40.50*1000`, `(100+200)/3`, or `500-25.50`. Enter evaluates
+and advances or saves as usual; Tab evaluates before changing fields. Typing a
+second decimal digit does not submit, so you can continue the calculation. Invalid
+calculations stay in the field with an error so you can correct them. Long
+calculations scroll within the field.
 
-```
-mdl cash.md debit 40500 '#1000*40.50 currency exchange'   # lint: agrees
-mdl cash.md debit 40000 '#1000*40.50 currency exchange'   # lint: description computes 40500.00 but the row is 40000.00
-```
-
-On the command line the `#` needs quoting, or the shell reads it as a comment.
+Only the calculated amount is saved, rounded to cents. A calculation in Balance
+sets the target balance and creates the debit or credit needed to reach it.
+Descriptions are plain text; existing `#` descriptions remain unchanged and are
+no longer evaluated or checked by `lint`.
 
 ## Printing to PDF
 

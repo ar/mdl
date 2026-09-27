@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use std::{fs, process};
 
 use crate::git;
-use crate::ledger::{Doc, Entry, add_entry, delete_entry, desc_expr, edit_entry, entry_what, fmt_amount, fmt_col, insert_entry, load, move_entry, parse_amount, push_pending, recalc, recalc_diff, today};
+use crate::ledger::{Doc, Entry, add_entry, delete_entry, amount_arg, edit_entry, entry_what, fmt_amount, fmt_col, insert_entry, load, move_entry, parse_amount, push_pending, recalc, recalc_diff, today};
 use crate::render::{grid, natural_widths, render_lines, totals};
 
 fn stty(args: &[&str]) -> Option<String> {
@@ -350,6 +350,11 @@ fn amount_view(s: &str, w: usize, focused: bool, cur: usize) -> (String, usize) 
         let c = shown.chars().count();
         return (format!("{shown:>w$}"), c);
     }
+    if s.contains(['+', '*', '/', '(', ')', ' ']) || s.trim_start_matches('-').contains('-')
+        || s.split_once('.').is_some_and(|(_, d)| d.len() > 2) {
+        let (text, cur) = field_view(s, w, cur);
+        return (format!("{text:<w$}"), cur);
+    }
     let cur = cur.min(n);
     match s.split_once('.') {
         Some((int, dec)) => {
@@ -413,16 +418,10 @@ impl GitStatus {
 // field, reached by Enter through an empty debit and credit (or a click, never Tab): a
 // balance typed there makes the row the debit or credit that gets there from the
 // previous balance (the last row's, or for an edit or `n` the row above's). A
-// click on a field focuses it. The amount fields take digits, one `.` and a leading
-// `-`, Clipper style: left-aligned while typing, aligned on the point once it is
-// pressed, right-aligned and normalised (`1234.50`) once left; the second decimal
-// leaves the field as Enter would. Enter on a filled debit submits (the credit is
-// then empty by definition); on an empty one it moves to the credit. Coming back to
-// an amount with a value, Backspace clears it whole and typing replaces it. A
-// description starting with `#` and a computation (`#1000*40.50 currency exchange`,
-// `#100+200 varios`) fills the amount field entered next, a negative one the credit;
-// the fill follows the focus to the other amount field until it is typed over, and is
-// recomputed when the description is left again. After a save the account field stays filled but
+// click on a field focuses it. Amount fields accept arithmetic and evaluate on Enter
+// or a field change. Enter on a filled debit submits; an empty one advances to credit.
+// Returning to an amount selects it: Backspace clears it and typing replaces it.
+// Descriptions are plain text. After a save the account field stays filled but
 // "selected": typing replaces it, Enter keeps it. Opening an account with stale
 // balances offers a recalc on the status line first.
 //
@@ -441,7 +440,7 @@ impl GitStatus {
 // into another day adopts that day), and so does dragging it with the mouse (saved on
 // release, Esc cancels), Esc or Down past the last entry return to the form.
 //
-// Search: `/` (from the statement, an empty description or an amount field) opens a
+// Search: `/` (from the statement, an empty description or an empty amount field) opens a
 // prompt on the status line; typing selects the nearest match at or above the selection
 // (the newest entries are at the bottom), Enter or Up the next older one, Down the next
 // newer one, wrapping around. Text matches the date or the description (case ignored),
@@ -489,9 +488,6 @@ struct Tui {
     /// go right below it instead.
     editing: Option<usize>,
     insert: bool,
-    /// An amount field holding the description's computation, untouched so far: it
-    /// follows the focus into the other amount field.
-    prefill: Option<usize>,
     /// Mouse button down on an entry: where it was (index, date) when pressed. The
     /// entry follows the pointer in memory; the release saves.
     drag: Option<(usize, String)>,
@@ -550,7 +546,6 @@ impl Tui {
             sel: None,
             editing: None,
             insert: false,
-            prefill: None,
             drag: None,
             msg: String::new(),
             posts: vec![],
@@ -922,38 +917,8 @@ impl Tui {
         if self.fixed_account && self.editing.is_none() && f == 0 {
             return;
         }
-        let from = self.focus;
-        let mut f = f;
-        if from >= 2 && from != f {
-            let s = &mut self.fields[from];
-            if let Ok(v) = parse_amount(s.trim()) {
-                *s = fmt_col(v);
-            }
-        }
-        // A computation at the start of the description fills the amount field entered
-        // from it, a negative one the credit (the value is the row's effect on the
-        // balance); leaving the description again recomputes an untouched fill. An
-        // untouched fill follows the focus into the other amount field.
-        if from == 1 && f >= 2 {
-            if let Some(k) = self.prefill.take() {
-                self.fields[k].clear();
-            }
-            if self.fields[2].is_empty() && self.fields[3].is_empty() {
-                match desc_expr(self.fields[1].trim()) {
-                    Some(Ok(v)) if v != 0 => {
-                        if v < 0 {
-                            f = 3;
-                        }
-                        self.fields[f] = fmt_col(v.abs());
-                        self.prefill = Some(f);
-                    }
-                    Some(Err(e)) => self.msg = e,
-                    _ => {}
-                }
-            }
-        } else if self.prefill == Some(from) && (2..=3).contains(&f) && f != from && self.fields[f].is_empty() {
-            self.fields[f] = std::mem::take(&mut self.fields[from]);
-            self.prefill = Some(f);
+        if self.focus >= 2 && self.focus != f && !self.finish_amount() {
+            return;
         }
         self.focus = f;
         self.cur = usize::MAX;
@@ -1039,11 +1004,14 @@ impl Tui {
         Some(out)
     }
 
-    /// Enter (or the second decimal of an amount): next field, or submit. A filled debit
+    /// Enter: evaluate an amount, then next field or submit. A filled debit
     /// submits too, since the credit is then meant to be empty; when it is not (an edit
     /// turning a credit into a debit) Enter goes there so the conflict is in view. An
     /// empty credit after an empty debit goes on to the balance field (Tab never does).
     fn enter(&mut self) {
+        if self.focus >= 2 && !self.finish_amount() {
+            return;
+        }
         let amount = |s: &str| parse_amount(s.trim()).unwrap_or(0);
         let debit_done = self.focus == 2 && amount(&self.fields[2]) != 0 && amount(&self.fields[3]) == 0;
         let no_amount = amount(&self.fields[2]) == 0 && amount(&self.fields[3]) == 0;
@@ -1062,8 +1030,8 @@ impl Tui {
     /// in the last field, whatever takes the balance there from `from` (the balance of
     /// the row before the one being saved).
     fn amounts(&self, from: i64) -> Result<(i64, i64), String> {
-        let d = parse_amount(self.fields[2].trim())?;
-        let c = parse_amount(self.fields[3].trim())?;
+        let d = amount_arg(self.fields[2].trim())?;
+        let c = amount_arg(self.fields[3].trim())?;
         let target = self.fields[4].trim();
         if target.is_empty() {
             return Ok((d, c));
@@ -1071,7 +1039,7 @@ impl Tui {
         if d != 0 || c != 0 {
             return Err("an amount or a balance to reach, not both".into());
         }
-        let diff = parse_amount(target)? - from;
+        let diff = amount_arg(target)? - from;
         if diff == 0 {
             return Err(format!("the balance is {} already", fmt_amount(from)));
         }
@@ -1102,38 +1070,38 @@ impl Tui {
         }
     }
 
-    /// A key in an amount field, at the cursor: digits, one `.` (with a 0 in front when
-    /// nothing is), a leading `-`; the integer part stops at what fits before the point,
-    /// the decimals at two. The second decimal typed at the end leaves the field as
-    /// Enter would.
-    fn type_amount(&mut self, c: char) {
-        let w = self.w[self.focus];
-        let mut cur = self.cur();
-        let mut t: Vec<char> = self.fields[self.focus].chars().collect();
-        let at_end = cur == t.len();
-        match c {
-            '0'..='9' => t.insert(cur, c),
-            '.' if !t.contains(&'.') => {
-                if t[..cur].iter().all(|c| *c == '-') {
-                    t.insert(cur, '0');
-                    cur += 1;
-                }
-                t.insert(cur, '.');
+    /// Evaluate before leaving an amount field; keep invalid input available to fix.
+    fn finish_amount(&mut self) -> bool {
+        let s = self.fields[self.focus].trim();
+        match amount_arg(s) {
+            Ok(v) => {
+                self.fields[self.focus] = if self.focus == 4 && !s.is_empty() {
+                    fmt_amount(v)
+                } else {
+                    fmt_col(v)
+                };
+                self.cur = usize::MAX;
+                true
             }
-            '-' if t.is_empty() => t.push('-'),
-            _ => return,
+            Err(e) => {
+                self.msg = e;
+                false
+            }
         }
-        let s: String = t.iter().collect();
-        let (int, dec) = s.split_once('.').unwrap_or((&s, ""));
-        let (ni, nd) = (int.trim_start_matches('-').chars().count(), dec.chars().count());
-        if nd > 2 || ni > w.saturating_sub(3) {
+    }
+
+    /// Amounts accept arithmetic while typing; Enter or a field change evaluates it.
+    fn type_amount(&mut self, c: char) {
+        if !(c.is_ascii_digit() || " .+-*/()".contains(c)) || self.fields[self.focus].len() >= 256 {
             return;
         }
-        self.fields[self.focus] = s;
-        self.cur = cur + 1;
-        if at_end && nd == 2 {
-            self.enter();
+        if c == '.' {
+            let before = &self.fields[self.focus][..byte_at(&self.fields[self.focus], self.cur())];
+            if before.is_empty() || before.ends_with(['+', '-', '*', '/', '(']) {
+                self.insert_char('0');
+            }
         }
+        self.insert_char(c);
     }
 
     // ---- actions -----------------------------------------------------------
@@ -1275,7 +1243,6 @@ impl Tui {
                 self.cur = usize::MAX;
                 self.select = !self.fixed_account;
                 self.sel = None;
-                self.prefill = None;
                 self.rebuild();
             }
             Err(e) => self.msg = e,
@@ -1305,7 +1272,6 @@ impl Tui {
         self.fields = [self.stem(), String::new(), String::new(), String::new(), String::new()];
         self.focus = usize::from(self.fixed_account);
         self.cur = usize::MAX;
-        self.prefill = None;
     }
 
     fn record_post(&mut self, i: usize) {
@@ -1505,7 +1471,6 @@ impl Tui {
         self.select = false;
         self.sel = None;
         self.editing = None;
-        self.prefill = None;
         self.search = None;
         self.offer_recalc = false;
         self.accounts.clear();
@@ -1637,7 +1602,7 @@ impl Tui {
             }
             Key::Char(' ') if self.sel.is_some() && self.editing.is_none() => self.flag(self.sel.unwrap()),
             Key::Char('n') if self.sel.is_some() && self.editing.is_none() => self.start_insert(self.sel.unwrap()),
-            Key::Char('/') if self.editing.is_none() && (self.sel.is_some() || self.focus >= 2 || (self.focus == 1 && self.fields[1].is_empty())) => {
+            Key::Char('/') if self.editing.is_none() && (self.sel.is_some() || (self.focus >= 2 && self.fields[self.focus].is_empty()) || (self.focus == 1 && self.fields[1].is_empty())) => {
                 self.start_search()
             }
             Key::Char(c) => {
@@ -1649,9 +1614,6 @@ impl Tui {
                     self.cur = usize::MAX;
                 }
                 self.select = false;
-                if self.prefill == Some(self.focus) {
-                    self.prefill = None;
-                }
                 if self.focus >= 2 {
                     self.type_amount(c);
                 } else {
@@ -1668,9 +1630,6 @@ impl Tui {
                         self.select = false;
                     } else {
                         self.erase(true);
-                    }
-                    if self.prefill == Some(self.focus) {
-                        self.prefill = None;
                     }
                 }
             }
@@ -1716,9 +1675,6 @@ impl Tui {
                     self.delete(i);
                 } else {
                     self.erase(false);
-                    if self.prefill == Some(self.focus) {
-                        self.prefill = None;
-                    }
                 }
             }
             Key::Left | Key::Right | Key::Home | Key::End => {
@@ -2627,13 +2583,14 @@ mod tests {
         assert_eq!((t.rows().len(), e.debit, e.credit, e.balance, e.desc.as_str()), (6, 0, 700, 27000, "Reconciled"));
         assert_eq!((t.focus, t.fields[4].as_str()), (0, ""));
 
-        // a higher one a debit; the second decimal submits from there too
+        // a higher one is a debit; Enter submits the target balance
         t.fields = [stem.clone(), "Reconciled 2".into(), String::new(), String::new(), String::new()];
         t.focus = 2;
         t.handle(Key::Enter);
         t.handle(Key::Enter);
         assert_eq!(t.focus, 4);
         type_all(&mut t, "300.25");
+        t.handle(Key::Enter);
         let e = t.rows().last().unwrap();
         assert_eq!((t.rows().len(), e.debit, e.credit, e.balance), (7, 3025, 0, 30025));
 
@@ -2715,7 +2672,7 @@ mod tests {
         t.handle(Key::End);
         assert!(t.draw().contains("nta café"));
 
-        // amounts: fix a digit without retyping; the second decimal submits only at the end
+        // amounts: fix a digit without retyping; Enter submits
         t.handle(Key::Next);
         assert_eq!((t.focus, t.cur()), (2, 0));
         type_all(&mut t, "1234.5");
@@ -2731,10 +2688,11 @@ mod tests {
         t.handle(Key::Delete);
         assert_eq!(t.fields[2], "7294.5");
         t.handle(Key::End);
-        t.handle(Key::Char('0')); // second decimal at the end: submits
+        t.handle(Key::Char('0'));
+        t.handle(Key::Enter);
         assert_eq!((t.rows().len(), t.rows()[5].debit, t.focus), (6, 729450, 0));
 
-        // a point with nothing in front gets its 0; too many decimals are refused
+        // a point with nothing in front gets its 0; invalid amounts are caught on Enter
         t.fields[1] = "x".into();
         t.focus = 2;
         t.cur = usize::MAX;
@@ -2743,7 +2701,9 @@ mod tests {
         t.handle(Key::Char('.'));
         assert_eq!((t.fields[2].as_str(), t.cur()), ("0.50", 2));
         t.handle(Key::Char('1'));
-        assert_eq!(t.fields[2], "0.50");
+        assert_eq!(t.fields[2], "0.150");
+        t.handle(Key::Enter);
+        assert!(t.msg.contains("bad amount"));
         let _ = fs::remove_dir_all(&dir);
     }
 
@@ -2768,7 +2728,9 @@ mod tests {
         assert_eq!((t.fields[2].as_str(), t.focus), ("150", 2));
         type_all(&mut t, ".5");
         assert_eq!((t.fields[2].as_str(), t.focus), ("150.5", 2));
-        type_all(&mut t, "0"); // second decimal of a debit: the entry is submitted
+        type_all(&mut t, "0");
+        assert_eq!(t.rows().len(), 5); // decimals alone never submit
+        t.handle(Key::Enter);
         assert_eq!((t.rows().len(), t.rows()[5].debit, t.focus), (6, 15050, 0));
         assert!(fs::read_to_string(&file).unwrap().contains("| d1 "));
 
@@ -2801,13 +2763,14 @@ mod tests {
         t.handle(Key::Next); // moving away disarms without touching the value
         assert_eq!(t.fields[2], "150.50");
         t.set_focus(2);
-        // only digits, one point, a leading minus; the typed 9 replaces the old value
+        // arithmetic characters are accepted; letters are ignored
         type_all(&mut t, "9x.-");
-        assert_eq!(t.fields[2], "9.");
+        assert_eq!(t.fields[2], "9.-");
         t.fields[2].clear();
         type_all(&mut t, "-.5");
         assert_eq!(t.fields[2], "-0.5"); // a leading point gets its zero
-        type_all(&mut t, "0"); // submit attempt: a negative debit is refused, focus stays
+        type_all(&mut t, "0");
+        t.handle(Key::Enter); // negative debit refused
         assert_eq!((t.fields[2].as_str(), t.focus), ("-0.50", 2));
         assert!(t.msg.contains("positive"));
 
@@ -2823,8 +2786,9 @@ mod tests {
         assert_eq!((t.fields[2].as_str(), t.focus), ("", 3));
         assert!(t.draw().contains("\x1b[0m          \x1b[0m")); // empty debit, right-aligned view
 
-        // the second decimal in the credit field submits, like Enter
+        // Enter submits the credit
         type_all(&mut t, "12.34");
+        t.handle(Key::Enter);
         let last = t.rows().last().unwrap();
         assert_eq!((t.rows().len(), last.credit, last.desc.as_str(), t.focus), (8, 1234, "d3", 0));
 
@@ -3013,87 +2977,68 @@ mod tests {
     }
 
     #[test]
-    fn tui_fills_the_amount_from_the_description() {
-        let dir = std::env::temp_dir().join(format!("mdl-tui-expr-{}", std::process::id()));
+    fn calculations_in_amount_fields() {
+        let dir = std::env::temp_dir().join(format!("mdl-tui-calc-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let file = dir.join("cash.md");
+        let path = file.to_str().unwrap();
         fs::write(&file, cash_head(5)).unwrap();
-        let path = file.to_str().unwrap().to_string();
         let mut t = Tui::new();
         t.in_repo = false;
-        t.account = Some((path.clone(), load(&path).unwrap()));
-        t.rebuild();
-        let stem = path.trim_end_matches(".md").to_string();
-        let type_all = |t: &mut Tui, s: &str| s.chars().for_each(|c| assert!(t.handle(Key::Char(c))));
-
-        // Enter from the description fills the debit, selected; Enter again submits it
-        t.fields = [stem.clone(), String::new(), String::new(), String::new(), String::new()];
-        t.focus = 1;
-        type_all(&mut t, "#1000*40.50 cambio");
+        t.fixed_account = true;
+        t.open_path(path).unwrap();
+        let type_all = |t: &mut Tui, s: &str| s.chars().for_each(|c| { t.handle(Key::Char(c)); });
+        for (focus, expression, value) in [(2, "40.50*1000", 4050000), (3, "(100+200)/3", 10000), (4, "1-1", 0)] {
+            t.fields[1] = "Calculation".into();
+            t.set_focus(focus);
+            let count = t.rows().len();
+            type_all(&mut t, expression);
+            assert_eq!(t.rows().len(), count);
+            assert!(t.search.is_none());
+            t.handle(Key::Enter);
+            assert_eq!(t.rows().len(), count + 1, "{}", t.msg);
+            let row = t.rows().last().unwrap();
+            assert_eq!(match focus { 2 => row.debit, 3 => row.credit, _ => row.balance }, value);
+            assert_eq!(row.desc, "Calculation");
+            assert!(!fs::read_to_string(&file).unwrap().contains(expression));
+        }
+        // Descriptions never supply amounts, including old # expressions.
+        t.fields[1] = "#10/0 historical text".into();
         t.handle(Key::Enter);
-        assert_eq!((t.focus, t.fields[2].as_str(), t.prefill, t.select), (2, "40500.00", Some(2), true));
+        assert_eq!((t.focus, t.fields[2].as_str()), (2, ""));
+        type_all(&mut t, "10/0");
+        let count = t.rows().len();
         t.handle(Key::Enter);
-        let e = t.rows().last().unwrap();
-        assert_eq!((t.rows().len(), e.debit, e.desc.as_str()), (6, 4050000, "#1000*40.50 cambio"));
-        assert!(lint(t.rows()).is_empty());
-
-        // the fill follows Tab into the credit, and submits from there
-        t.fields = [stem.clone(), "#100+200 varios".into(), String::new(), String::new(), String::new()];
-        t.focus = 1;
-        t.handle(Key::Enter);
+        assert_eq!(t.msg, "division by zero");
         t.handle(Key::Next);
-        assert_eq!((t.focus, t.fields[2].as_str(), t.fields[3].as_str(), t.prefill), (3, "", "300.00", Some(3)));
-        t.handle(Key::Prev); // and back
-        assert_eq!((t.focus, t.fields[2].as_str(), t.fields[3].as_str()), (2, "300.00", ""));
-        t.handle(Key::Enter); // a positive computation is a debit
-        assert_eq!((t.rows().len(), t.rows()[6].debit), (7, 30000));
-
-        // typing over the fill makes it the user's: it no longer travels
-        t.fields = [stem.clone(), "#2*5 x".into(), String::new(), String::new(), String::new()];
-        t.focus = 1;
-        t.handle(Key::Enter);
-        type_all(&mut t, "7");
-        assert_eq!((t.fields[2].as_str(), t.prefill), ("7", None));
+        assert_eq!((t.focus, t.fields[2].as_str(), t.rows().len()), (2, "10/0", count));
+        t.handle(Key::Backspace);
+        type_all(&mut t, "3");
         t.handle(Key::Next);
-        assert_eq!((t.fields[2].as_str(), t.fields[3].as_str()), ("7.00", ""));
-
-        // back to the description with a new formula: the untouched fill is recomputed,
-        // and one that no longer computes is cleared
-        t.fields = [stem.clone(), "#2*5 x".into(), String::new(), String::new(), String::new()];
-        t.focus = 1;
+        assert_eq!((t.focus, t.fields[2].as_str()), (3, "3.33"));
         t.handle(Key::Enter);
-        assert_eq!(t.fields[2], "10.00");
-        t.handle(Key::Prev);
-        t.fields[1] = "#3*5 x".into();
-        t.handle(Key::Enter);
-        assert_eq!((t.fields[2].as_str(), t.prefill), ("15.00", Some(2)));
-        t.handle(Key::Next); // travels to the credit
-        t.handle(Key::Prev);
-        t.handle(Key::Prev); // back to the description from the debit
-        t.fields[1] = "plain text".into();
-        t.handle(Key::Enter);
-        assert_eq!((t.fields[2].as_str(), t.fields[3].as_str(), t.prefill), ("", "", None));
-
-        // a negative computation fills the credit and goes there: formula, Enter, Enter
-        t.fields = [stem.clone(), "#-1000*40.50 venta USD".into(), String::new(), String::new(), String::new()];
-        t.focus = 1;
-        t.handle(Key::Enter);
-        assert_eq!((t.focus, t.fields[2].as_str(), t.fields[3].as_str(), t.prefill), (3, "", "40500.00", Some(3)));
-        t.handle(Key::Enter);
-        let e = t.rows().last().unwrap();
-        assert_eq!((e.credit, e.debit, e.desc.as_str()), (4050000, 0, "#-1000*40.50 venta USD"));
+        assert_eq!(t.rows().last().unwrap().debit, 333);
         assert!(lint(t.rows()).is_empty());
-
-        // a bad `#` computation is reported, no fill; prose fills nothing
-        t.fields = [stem.clone(), "#10/0 x".into(), String::new(), String::new(), String::new()];
-        t.focus = 1;
+        // Editing an existing row uses the same evaluator.
+        t.start_edit(t.rows().len() - 1);
+        t.set_focus(2);
+        type_all(&mut t, "(2+3)*4");
         t.handle(Key::Enter);
-        assert_eq!((t.fields[2].as_str(), t.msg.as_str()), ("", "bad expression `10/0`: division by zero"));
-        t.fields = [stem.clone(), "1000*40.50 cambio".into(), String::new(), String::new(), String::new()];
-        t.focus = 1;
-        t.handle(Key::Enter);
-        assert_eq!((t.fields[2].as_str(), t.prefill), ("", None));
-        let _ = fs::remove_dir_all(&dir);
+        assert!(t.editing.is_none());
+        assert_eq!(load(path).unwrap().rows.last().unwrap().debit, 2000);
+        for expression in ["2+", "(1+2", "1.2.3", "999999999999999999999999999999999"] {
+            t.focus = 2;
+            t.fields[2] = expression.into();
+            t.handle(Key::Enter);
+            assert_eq!(t.fields[2], expression);
+            assert_eq!(t.focus, 2);
+            assert!(!t.msg.is_empty());
+        }
+        let expression = "100.25+200.50+300.75";
+        let (shown, cur) = amount_view(expression, 10, true, usize::MAX);
+        assert_eq!(shown.chars().count(), 10);
+        assert!(cur < 10);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

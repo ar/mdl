@@ -1,5 +1,5 @@
 //! The ledger: entries and the document around the table, amounts, dates, periods,
-//! `#` expressions, lint, recalc, and saving (with a commit when the repository asks).
+//! arithmetic expressions, lint, recalc, and saving (with a commit when the repository asks).
 use std::time::{SystemTime, UNIX_EPOCH};
 use std::fs;
 use std::path::Path;
@@ -32,7 +32,9 @@ pub fn parse_amount(s: &str) -> Result<i64, String> {
     if int.is_empty() || frac.len() > 2 || !digits {
         return Err(format!("bad amount `{s}`"));
     }
-    let cents = int.parse::<i64>().unwrap() * 100 + format!("{frac:0<2}").parse::<i64>().unwrap();
+    let cents = int.parse::<i64>().ok().and_then(|v| v.checked_mul(100))
+        .and_then(|v| v.checked_add(format!("{frac:0<2}").parse::<i64>().ok()?))
+        .ok_or_else(|| format!("amount out of range `{s}`"))?;
     Ok(if neg { -cents } else { cents })
 }
 
@@ -263,28 +265,16 @@ fn eval_expr(s: &str) -> Result<i64, String> {
         return Err("not a number".into());
     }
     let cents = v * 100.0;
-    Ok((cents + cents.signum() * 1e-6).round() as i64)
-}
-
-/// The computation a description starts with: a `#` and an expression with at least one
-/// operator, e.g. `#1000*40.50 currency exchange` or `#100+200+50 varios`. Its value is
-/// the row's effect on the balance: positive is a debit, negative (`#-1000*40.50 venta
-/// USD`) a credit. Without the `#` a description is prose, however it looks (`2-3
-/// people`, `1000*40.50 cambio`), and so is `#123 invoice`: a `#` with just a number.
-/// None: no computation. Some(Err): a computation that does not evaluate.
-pub fn desc_expr(desc: &str) -> Option<Result<i64, String>> {
-    let body = desc.strip_prefix('#')?;
-    let expr: String = body.chars().take_while(|c| c.is_ascii_digit() || " .+-*/()".contains(*c)).collect();
-    let expr = expr.trim();
-    if expr.is_empty() || !expr.starts_with(|c: char| c.is_ascii_digit() || c == '(' || c == '-') || !expr.contains(['+', '-', '*', '/', '(']) {
-        return None;
+    let rounded = (cents + cents.signum() * 1e-6).round();
+    if !rounded.is_finite() || rounded >= i64::MAX as f64 || rounded <= i64::MIN as f64 {
+        return Err("amount out of range".into());
     }
-    Some(eval_expr(expr).map_err(|e| format!("bad expression `{expr}`: {e}")))
+    Ok(rounded as i64)
 }
 
 /// An amount as typed, or a computation (`1000*40.50`).
 pub fn amount_arg(s: &str) -> Result<i64, String> {
-    if s != "-" && s.contains(['+', '*', '/', '(']) || s.trim_start_matches('-').contains('-') {
+    if s.contains(['+', '*', '/', '(']) || s.trim_start_matches('-').contains('-') {
         eval_expr(s)
     } else {
         parse_amount(s)
@@ -309,13 +299,7 @@ pub fn lint(rows: &[Entry]) -> Vec<String> {
         if e.balance != bal {
             errs.push(format!("row {n}: balance {} should be {}", fmt_amount(e.balance), fmt_amount(bal)));
         }
-        match desc_expr(&e.desc) {
-            Some(Ok(v)) if v != e.debit - e.credit => {
-                errs.push(format!("row {n}: description computes {} but the row is {}", fmt_amount(v), fmt_amount(e.debit - e.credit)));
-            }
-            Some(Err(err)) => errs.push(format!("row {n}: {err}")),
-            _ => {}
-        }
+
     }
     errs
 }
@@ -819,38 +803,16 @@ pub mod tests {
         assert_eq!(eval_expr("2 x").unwrap_err(), "unexpected `x`");
         assert_eq!(eval_expr("1.2.3").unwrap_err(), "bad number `1.2.3`");
 
-        assert_eq!(desc_expr("#1000*40.50 currency exchange"), Some(Ok(4050000)));
-        assert_eq!(desc_expr("1000*40.50 currency exchange"), None); // no `#`: prose
-        assert_eq!(desc_expr("#(10+5)*2 lotes"), Some(Ok(3000)));
-        assert_eq!(desc_expr("#3/4 pantalón"), Some(Ok(75)));
-        assert_eq!(desc_expr("#2-3 people"), Some(Ok(-100)));
-        assert_eq!(desc_expr("2-3 people"), None);
-        assert_eq!(desc_expr("3 cafés"), None);
-        assert_eq!(desc_expr("Venta mostrador"), None);
-        assert_eq!(desc_expr("#100+200+50 varios"), Some(Ok(35000)));
-        assert_eq!(desc_expr("#123 invoice"), None);
-        assert_eq!(desc_expr("#100/0 x"), Some(Err("bad expression `100/0`: division by zero".into())));
-        assert_eq!(desc_expr("2 (dos) cafés"), None); // not an expression: ignored
-        assert_eq!(desc_expr("#-1000*40.50 venta USD"), Some(Ok(-4050000)));
-        assert_eq!(desc_expr("-1000*40.50 venta USD"), None);
-        assert_eq!(desc_expr("#-3 people"), Some(Ok(-300))); // a signed number is a computation
-        assert_eq!(desc_expr("#1 +"), Some(Err("bad expression `1 +`: missing operand".into())));
-
         assert_eq!(amount_arg("150.50").unwrap(), 15050);
         assert_eq!(amount_arg("-").unwrap(), 0);
         assert_eq!(amount_arg("1000*40.50").unwrap(), 4050000);
         assert!(amount_arg("abc").is_err());
 
         let mut rows = sample();
-        rows[1].desc = "#-(10+20) b".into(); // computes -30.00, the credit row is -0.30
-        rows[2].desc = "#10*1 c".into(); // 10.00 vs debit 0.10
-        assert_eq!(lint(&rows), ["row 2: description computes -30.00 but the row is -0.30", "row 3: description computes 10.00 but the row is 0.10"]);
-        rows[1].credit = 3000;
-        rows[2].debit = 1000;
-        recalc(&mut rows);
+        rows[1].desc = "#10/0 historical description".into();
+        rows[2].desc = "#1000*40.50 exchange".into();
         assert!(lint(&rows).is_empty());
-        rows[1].desc = "#10+20 b".into(); // a positive computation on a credit row is wrong
-        assert_eq!(lint(&rows), ["row 2: description computes 30.00 but the row is -30.00"]);
+
     }
 
     /// A `|` in a description is written `\|` and read back as a pipe; the cell count
