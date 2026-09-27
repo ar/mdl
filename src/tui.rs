@@ -494,7 +494,7 @@ struct Tui {
     msg: String,
     /// Snapshots of successfully posted entries, across all accounts in this session.
     posts: Vec<(String, Entry)>,
-    /// Number of newest posts skipped in the history popup; None closes it.
+    /// Number of newest posts skipped in the history view; None closes it.
     history_scroll: Option<usize>,
     /// The search prompt, while open.
     search: Option<String>,
@@ -679,6 +679,9 @@ impl Tui {
     }
 
     fn draw(&self) -> String {
+        if self.history_scroll.is_some() {
+            return self.history_view();
+        }
         let mut out = String::from("\x1b[?25l\x1b[H");
         let pad = self.view.saturating_sub(self.lines.len());
         for r in 0..self.view {
@@ -766,55 +769,69 @@ impl Tui {
             let col = cell_start(&self.w, self.focus) + view(self.focus).1;
             out += &format!("\x1b[{};{}H\x1b[?25h", self.field_row(), col + 1);
         }
-        if self.history_scroll.is_some() {
-            out += &self.history_popup();
-        }
         out
     }
 
-    fn history_height(&self) -> usize {
-        (self.posts.len().max(1) + 2).min(self.h.saturating_sub(1)).max(3)
+    fn history_page(&self) -> usize {
+        self.h.saturating_sub(if self.h >= 7 { 6 } else { 3 }).max(1)
     }
 
-    fn history_popup(&self) -> String {
-        let height = self.history_height();
-        let width = self.cols.saturating_sub(2).min(96);
-        let inner = width - 2;
-        let first_row = (self.h - height) / 2 + 1;
-        let first_col = (self.cols - width) / 2 + 1;
-        let visible = height - 2;
-        let scroll = self.history_scroll.unwrap_or(0).min(self.posts.len().saturating_sub(visible));
-        let title = clipped(&format!(" Posts this session ({}) ", self.posts.len()), inner);
-        let mut lines = vec![format!("╭{title}{}╮", "─".repeat(inner - title.chars().count()))];
-        for i in 0..visible {
-            let content = match self.posts.iter().rev().nth(scroll + i) {
-                Some((path, e)) => {
-                    let amount = if e.debit != 0 { format!("+{}", fmt_amount(e.debit)) }
-                        else if e.credit != 0 { format!("-{}", fmt_amount(e.credit)) }
-                        else { "note".into() };
-                    let account = path.trim_end_matches(".md");
-                    if inner >= 55 {
-                        format!("{}  {}  {}  {}", clipped_tail(account, 18), e.date, amount, e.desc)
-                    } else if inner >= 36 {
-                        format!("{}  {}  {}", clipped_tail(account, 15), amount, e.desc)
-                    } else {
-                        format!("{}  {}", clipped_tail(account, inner.saturating_sub(12)), amount)
-                    }
+    fn history_view(&self) -> String {
+        let mut headers = vec!["Date", "Account", "Description", "Debit", "Credit"];
+        if self.fixed_account { headers.remove(1); }
+        let rows: Vec<Vec<String>> = self.posts.iter().rev().map(|(path, e)| {
+            let mut row = vec![e.date.clone(), path.trim_end_matches(".md").to_string(),
+                e.desc.clone(), fmt_col(e.debit), fmt_col(e.credit)];
+            if self.fixed_account { row.remove(1); }
+            row
+        }).collect();
+        let desc = headers.len() - 3;
+        let mut widths: Vec<usize> = headers.iter().enumerate().map(|(i, header)| {
+            rows.iter().map(|r| r[i].chars().count()).max().unwrap_or(0)
+                .max(header.len()).min(if i == desc { 48 } else { 24 })
+        }).collect();
+        let room = self.cols.saturating_sub(3 * headers.len() + 1);
+        while widths.iter().sum::<usize>() > room {
+            let Some((i, _)) = widths.iter().enumerate().filter(|(_, w)| **w > 1).max_by_key(|(_, w)| **w) else { break };
+            widths[i] -= 1;
+        }
+        widths[desc] += room.saturating_sub(widths.iter().sum());
+        let border = |left: &str, joint: &str, right: &str| {
+            format!("{left}{}{right}", widths.iter().map(|w| "─".repeat(w + 2)).collect::<Vec<_>>().join(joint))
+        };
+        let line = |cells: &[String], header: bool| {
+            let mut out = String::from("│");
+            for (i, (cell, &w)) in cells.iter().zip(&widths).enumerate() {
+                let text = if !self.fixed_account && i == 1 { clipped_tail(cell, w) } else { clipped(cell, w) };
+                if !header && i >= cells.len() - 2 {
+                    out += &format!(" {text:>w$} │");
+                } else {
+                    out += &format!(" {text:<w$} │");
                 }
-                None if self.posts.is_empty() => "No entries posted yet".into(),
-                None => String::new(),
-            };
-            let content = clipped(&content, inner);
-            lines.push(format!("│{content}{}│", " ".repeat(inner - content.chars().count())));
+            }
+            out
+        };
+        let page = self.history_page();
+        let scroll = self.history_scroll.unwrap_or(0).min(rows.len().saturating_sub(page));
+        let range = if rows.is_empty() { "0 entries".into() }
+            else { format!("{}–{} of {}", scroll + 1, (scroll + page).min(rows.len()), rows.len()) };
+        let mut lines = vec![format!("\x1b[1;36m{}\x1b[0m", clipped(&format!("Session history · {range} · newest first"), self.cols))];
+        if self.h >= 7 { lines.push(border("┌", "┬", "┐")); }
+        lines.push(format!("\x1b[1m{}\x1b[0m", line(&headers.iter().map(|s| s.to_string()).collect::<Vec<_>>(), true)));
+        if self.h >= 7 { lines.push(border("├", "┼", "┤")); }
+        for i in 0..page {
+            lines.push(match rows.get(scroll + i) {
+                Some(row) => line(row, false),
+                None if rows.is_empty() && i == 0 => format!("│ {:<w$} │", clipped("No entries posted yet", self.cols.saturating_sub(4)), w = self.cols.saturating_sub(4)),
+                None => line(&vec![String::new(); headers.len()], false),
+            });
         }
-        let hint = if inner < 48 { " Esc/Ctrl-H close · ↑/↓ scroll " }
-            else { " ↑ older  ↓ newer  PgUp/PgDn  Esc or Ctrl-H close " };
-        let hint = clipped(hint, inner);
-        lines.push(format!("╰{hint}{}╯", "─".repeat(inner - hint.chars().count())));
-        let mut out = String::from("\x1b[?25l");
-        for (i, line) in lines.iter().enumerate() {
-            out += &format!("\x1b[{};{}H\x1b[30;47m{line}\x1b[0m", first_row + i, first_col);
+        if self.h >= 7 { lines.push(border("└", "┴", "┘")); }
+        let mut out = String::from("\x1b[?25l\x1b[H");
+        for line in lines {
+            out += &format!("\x1b[2K{line}\r\n");
         }
+        out += &self.footer();
         out
     }
 
@@ -823,7 +840,8 @@ impl Tui {
         let (indicator, color) = self.git_indicator();
         let indicator: String = indicator.chars().take(self.cols).collect();
         let room = self.cols.saturating_sub(indicator.chars().count() + 2);
-        let hint = if self.editing.is_some() { "Enter save · Tab next · Ctrl-H posts · Esc cancel" }
+        let hint = if self.history_scroll.is_some() { "↑/↓ scroll · PgUp/PgDn · Ctrl-H/Esc back" }
+            else if self.editing.is_some() { "Enter save · Tab next · Ctrl-H posts · Esc cancel" }
             else if self.sel.is_some() { "Enter edit · n insert · / search · Ctrl-H posts · Esc back" }
             else { "Enter next / save · Tab next · Ctrl-H posts · Ctrl-S sync" };
         let hint: String = hint.chars().take(room).collect();
@@ -1541,15 +1559,15 @@ impl Tui {
     // ---- keys --------------------------------------------------------------
 
     fn history_key(&mut self, key: &Key) {
-        let page = self.history_height() - 2;
+        let page = self.history_page();
         let max_scroll = self.posts.len().saturating_sub(page);
-        let scroll = self.history_scroll.unwrap_or(0);
+        let scroll = self.history_scroll.unwrap_or(0).min(max_scroll);
         self.history_scroll = match key {
             Key::Esc | Key::History => None,
-            Key::Prev | Key::Wheel(-1) => Some((scroll + 1).min(max_scroll)),
-            Key::Next | Key::Wheel(1) => Some(scroll.saturating_sub(1)),
-            Key::PageUp => Some(scroll.saturating_add(page).min(max_scroll)),
-            Key::PageDown => Some(scroll.saturating_sub(page)),
+            Key::Next | Key::Wheel(1) => Some((scroll + 1).min(max_scroll)),
+            Key::Prev | Key::Wheel(-1) => Some(scroll.saturating_sub(1)),
+            Key::PageDown => Some(scroll.saturating_add(page).min(max_scroll)),
+            Key::PageUp => Some(scroll.saturating_sub(page)),
             _ => Some(scroll),
         };
     }
@@ -2296,7 +2314,7 @@ mod tests {
     }
 
     #[test]
-    fn session_posts_popup_tracks_adds_and_inserts() {
+    fn session_history_tracks_adds_and_inserts() {
         let dir = std::env::temp_dir().join(format!("mdl-tui-posts-{}", std::process::id()));
         fs::create_dir_all(&dir).unwrap();
         let cash = dir.join("cash.md");
@@ -2338,26 +2356,78 @@ mod tests {
         t.handle(Key::Enter);
         assert_eq!(t.posts.len(), 3); // rejected entries are absent
         t.handle(Key::History);
-        let popup = without_ansi(&t.history_popup());
-        assert!(popup.find("Transfer").unwrap() < popup.find("Receipt").unwrap());
-        assert!(popup.find("Receipt").unwrap() < popup.find("Lunch").unwrap());
-        assert!(popup.contains("bank"));
-        assert!(popup.contains("cash"));
+        let history = without_ansi(&t.history_view());
+        assert!(history.find("Transfer").unwrap() < history.find("Receipt").unwrap());
+        assert!(history.find("Receipt").unwrap() < history.find("Lunch").unwrap());
+        assert!(history.contains("bank"));
+        assert!(history.contains("cash"));
         let fields = t.fields.clone();
         t.handle(Key::Char('x'));
         assert_eq!(t.fields, fields); // modal keys never edit the form
         t.resize(6, 30);
         t.posts.extend([t.posts[0].clone(), t.posts[0].clone()]);
-        t.handle(Key::Prev);
-        assert_eq!(t.history_scroll, Some(1));
-        t.handle(Key::PageUp);
-        assert_eq!(t.history_scroll, Some(2));
         t.handle(Key::Next);
+        assert_eq!(t.history_scroll, Some(1));
+        t.handle(Key::PageDown);
+        assert_eq!(t.history_scroll, Some(2));
+        t.handle(Key::Prev);
         assert_eq!(t.history_scroll, Some(1));
         t.handle(Key::Esc);
         assert!(t.history_scroll.is_none());
         assert_eq!(t.fields, fields);
         let _ = fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_uses_the_main_screen_and_preserves_the_form() {
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.resize(24, 100);
+        t.handle(Key::History);
+        assert!(without_ansi(&t.draw()).contains("No entries posted yet"));
+        let row = Entry { date: "2026-09-27".into(), desc: "A long description with café".into(),
+            debit: 12345, credit: 0, balance: 12345, bold: false };
+        t.posts = vec![("bank/account.md".into(), row); 30];
+        t.fields = ["2026-09-27".into(), "Unsaved draft".into(), "1+2".into(), String::new(), String::new()];
+        t.editing = Some(2);
+        t.focus = 2;
+        t.cur = 1;
+        let fields = t.fields.clone();
+        let frame = t.draw();
+        let plain = without_ansi(&frame);
+        assert!(plain.contains("Session history"));
+        assert!(plain.contains("│ Account"));
+        assert!(plain.contains("Debit"));
+        assert!(plain.contains("Credit"));
+        assert!(plain.contains("123.45"));
+        assert!(!plain.contains("Balance"));
+        assert!(!plain.contains("Unsaved draft"));
+        assert!(!frame.contains("\x1b[30;47m"));
+        assert!(!frame.contains("\x1b[?25h"));
+        for key in [Key::Enter, Key::Char('x'), Key::Delete, Key::Clear, Key::Click(3, 5)] {
+            t.handle(key);
+        }
+        assert_eq!(t.fields, fields);
+        assert_eq!((t.editing, t.focus, t.cur), (Some(2), 2, 1));
+        for fixed in [false, true] {
+            t.fixed_account = fixed;
+            for (h, cols) in [(24, 100), (10, 60), (6, 30), (4, 21)] {
+                t.resize(h, cols);
+                let plain = without_ansi(&t.draw());
+                let lines: Vec<_> = plain.split("\r\n").collect();
+                assert_eq!(lines.len(), h);
+                assert!(lines.iter().all(|line| line.chars().count() <= cols));
+                if cols == 100 { assert_eq!(plain.contains("Account"), !fixed); }
+            }
+        }
+        t.handle(Key::Next);
+        assert_eq!(t.history_scroll, Some(1));
+        t.handle(Key::Wheel(-1));
+        assert_eq!(t.history_scroll, Some(0));
+        t.handle(Key::History);
+        assert!(t.history_scroll.is_none());
+        assert_eq!(t.fields, fields);
+        assert_eq!((t.editing, t.focus, t.cur), (Some(2), 2, 1));
     }
 
     #[test]
