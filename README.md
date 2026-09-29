@@ -245,4 +245,6 @@ the statement. `mdl <file> graph [balance|debit|credit]... [period]` displays ju
 chart; use `-o chart.png` to save it, including on terminals without inline graphics.
 The series and period work the same way as `print --graph`. All three use the same
 Typst chart definition and ledger data, so the graph's shape, colours, ticks and
-labels stay aligned. Inline display is disabled inside tmux and screen.
+labels stay aligned. When combining accounts, balance graphs plot each account's own
+balance in a separate colour and their sum as a dark line. Inline
+display is disabled inside tmux and screen.

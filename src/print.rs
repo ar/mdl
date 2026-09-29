@@ -17,6 +17,10 @@ fn typst_str(s: &str) -> String {
 /// chart). The file's name goes in the
 /// page footer, the period (or today) in the header.
 fn render_typst(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String]) -> String {
+    render_typst_accounts(doc, file, p, series, &[])
+}
+
+fn render_typst_accounts(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String], accounts: &[(String, Doc)]) -> String {
     let name = Path::new(file).file_name().map_or(file.to_string(), |n| n.to_string_lossy().into_owned());
     let title = doc.title().map_or(name.as_str(), |t| t[2..].trim());
     let when = match p {
@@ -86,7 +90,7 @@ fn render_typst(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[S
     out += &cells(&totals(&doc.rows), true);
     out += "  table.hline(stroke: 0.8pt),\n)\n\n#v(6pt)\n";
     if !series.is_empty() && !doc.rows.is_empty() {
-        out += &render_chart(doc, p, series);
+        out += &if accounts.is_empty() { render_chart(doc, p, series) } else { render_chart_accounts(doc, p, series, accounts) };
     }
     out += &prose(&doc.lines[doc.end..]);
     out
@@ -119,23 +123,42 @@ fn tick_step(range: i64) -> i64 {
 /// value of each series labelled in its colour. The geometry is computed here in day
 /// offsets and cents; the Typst only scales and draws.
 fn render_chart(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> String {
-    /// One charted series: its header column, its colour, and the value of each row it plots.
-    type Series<'a> = (usize, &'static str, Vec<(&'a Entry, i64)>);
+    render_chart_accounts(doc, p, series, &[])
+}
+
+fn render_chart_accounts(doc: &Doc, p: &Option<(String, String)>, requested: &[String], accounts: &[(String, Doc)]) -> String {
+    /// Caption, colour, and dated values of one plotted line.
+    type Series = (String, String, Vec<(String, i64)>);
     let (first, last) = (&doc.rows[0], &doc.rows[doc.rows.len() - 1]);
-    // (header column, colour, the rows' values) per series, skipping empty ones
-    let pick = |col: usize, color: &'static str, f: fn(&Entry) -> i64| -> Series {
-        (col, color, doc.rows.iter().map(|e| (e, f(e))).filter(|(_, v)| col == 4 || *v != 0).collect())
+    let pick = |doc: &Doc, label: String, col: usize, color: &str, f: fn(&Entry) -> i64| -> Series {
+        (label, color.to_string(), doc.rows.iter().map(|e| (e.date.clone(), f(e))).filter(|(_, v)| col == 4 || *v != 0).collect())
     };
-    let series: Vec<Series> = series
-        .iter()
-        .filter_map(|s| match s.as_str() {
-            "balance" => Some(pick(4, "#2a6fdb", |e| e.balance)),
-            "debit" => Some(pick(2, "#2a9d5c", |e| e.debit)),
-            "credit" => Some(pick(3, "#d1495b", |e| e.credit)),
-            _ => None,
-        })
-        .filter(|(_, _, v)| !v.is_empty())
-        .collect();
+    let colors = ["#2a6fdb", "#d1495b", "#2a9d5c", "#8a55b5", "#c56b22", "#167f88", "#a44d80", "#657128"];
+    let sources: Vec<(&str, &Doc)> = if accounts.is_empty() {
+        vec![("", doc)]
+    } else {
+        accounts.iter().map(|(name, doc)| (name.as_str(), doc)).collect()
+    };
+    let mut series = vec![];
+    for (name, account) in sources {
+        for s in requested {
+            let (col, color, f): (usize, &str, fn(&Entry) -> i64) = match s.as_str() {
+                "balance" => (4, "#2a6fdb", |e| e.balance),
+                "debit" => (2, "#2a9d5c", |e| e.debit),
+                "credit" => (3, "#d1495b", |e| e.credit),
+                _ => continue,
+            };
+            let label = if name.is_empty() { account.header[col].clone() } else { format!("{name} {}", account.header[col]) };
+            let color = if accounts.is_empty() { color } else { colors[series.len() % colors.len()] };
+            let line = pick(account, label, col, color, f);
+            if !line.2.is_empty() {
+                series.push(line);
+            }
+        }
+    }
+    if accounts.len() > 1 && requested.iter().any(|s| s == "balance") {
+        series.push(pick(doc, format!("Total {}", doc.header[4]), 4, "#24292f", |e| e.balance));
+    }
     if series.is_empty() {
         return String::new();
     }
@@ -177,11 +200,11 @@ fn render_chart(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> S
     let plots: Vec<String> = series
         .iter()
         .map(|(_, color, v)| {
-            let pts: Vec<String> = v.iter().map(|(e, v)| format!("({}, {v})", day_number(&e.date) - x0)).collect();
+            let pts: Vec<String> = v.iter().map(|(date, v)| format!("({}, {v})", day_number(date) - x0)).collect();
             format!("(({},), {}, rgb({}))", pts.join(", "), typst_str(&fmt_amount(v[v.len() - 1].1)), typst_str(color))
         })
         .collect();
-    let caption: Vec<String> = series.iter().map(|(c, color, _)| format!("text(fill: rgb({}), {})", typst_str(color), typst_str(&doc.header[*c]))).collect();
+    let caption: Vec<String> = series.iter().map(|(label, color, _)| format!("text(fill: rgb({}), {})", typst_str(color), typst_str(label))).collect();
     format!(
         r##"#let ledger-chart(span, lo, hi, yticks, months, series, h: 5.5cm) = layout(size => {{
   let w = size.width
@@ -198,6 +221,7 @@ fn render_chart(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> S
       place(line(start: (x(d), 0pt), end: (x(d), h), stroke: 0.4pt + luma(85%)))
       if x(d) + 36pt <= w {{ place(dx: x(d) + 3pt, dy: h + 4pt, small(label)) }}
     }}
+    let label-ys = ()
     for (pts, close, color) in series {{
       let (d0, v0) = pts.first()
       let prev = v0
@@ -216,6 +240,10 @@ fn render_chart(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> S
       let fell = pts.len() > 1 and pts.at(-2).at(1) > prev
       let below = (fell or y(prev) < 20pt) and y(prev) < h - 16pt
       let dy = if below {{ y(prev) + 5pt }} else {{ y(prev) - 15pt }}
+      for used in label-ys {{
+        if calc.abs(dy - used) < 14pt {{ dy = used - 16pt }}
+      }}
+      label-ys.push(dy)
       place(dx: x(span) - 80pt, dy: dy, box(width: 80pt, align(right,
         box(fill: white.transparentize(15%), inset: (x: 2pt, y: 1pt), radius: 2pt, text(8pt, weight: "bold", fill: color, close)))))
     }}
@@ -240,7 +268,7 @@ fn render_chart(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> S
 /// `print`: the statement typeset by `typst` (the source on its stdin) as `<file>.pdf`,
 /// or `<file>-<from>[-<to>].pdf` for a period; with `series`, those charted after the
 /// table. `out` overrides the PDF's path.
-pub fn print_pdf(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String], out: Option<&str>) -> Result<String, String> {
+pub fn print_pdf(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String], accounts: &[(String, Doc)], out: Option<&str>) -> Result<String, String> {
     let suffix = match p {
         Some((a, b)) if a == b => format!("-{a}"),
         Some((a, b)) => format!("-{a}-{b}"),
@@ -256,7 +284,8 @@ pub fn print_pdf(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[
         .stdin(process::Stdio::piped())
         .spawn()
         .map_err(|e| format!("typst: {e} (install it: brew install typst)"))?;
-    child.stdin.take().unwrap().write_all(render_typst(doc, file, p, series).as_bytes()).map_err(|e| format!("typst: {e}"))?;
+    let source = if accounts.is_empty() { render_typst(doc, file, p, series) } else { render_typst_accounts(doc, file, p, series, accounts) };
+    child.stdin.take().unwrap().write_all(source.as_bytes()).map_err(|e| format!("typst: {e}"))?;
     let st = child.wait().map_err(|e| format!("typst: {e}"))?;
     if !st.success() {
         return Err("typst failed".into());
@@ -266,10 +295,14 @@ pub fn print_pdf(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[
 
 /// Render the same Typst chart used by the PDF as a standalone PNG.
 pub fn graph_png(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> Result<Option<Vec<u8>>, String> {
+    graph_png_accounts(doc, p, series, &[])
+}
+
+pub fn graph_png_accounts(doc: &Doc, p: &Option<(String, String)>, series: &[String], accounts: &[(String, Doc)]) -> Result<Option<Vec<u8>>, String> {
     if doc.rows.is_empty() {
         return Ok(None);
     }
-    let chart = render_chart(doc, p, series);
+    let chart = if accounts.is_empty() { render_chart(doc, p, series) } else { render_chart_accounts(doc, p, series, accounts) };
     if chart.is_empty() {
         return Ok(None);
     }
@@ -405,5 +438,35 @@ mod tests {
         let png = graph_png(&doc, &None, &["balance".to_string()]).unwrap().unwrap();
         assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
         assert!(graph_png(&doc, &None, &[]).unwrap().is_none());
+    }
+
+    #[test]
+    fn combined_chart_keeps_accounts_and_adds_their_sum() {
+        let mut combined = load("cash.md").unwrap();
+        let cash = load("cash.md").unwrap();
+        let mut bank = load("cash.md").unwrap();
+        bank.rows.truncate(2);
+        bank.rows[0].debit = 500;
+        bank.rows[0].balance = 500;
+        bank.rows[1].debit = 1500;
+        bank.rows[1].balance = 2000;
+        combined.rows.extend(bank.rows.iter().cloned());
+        combined.rows.sort_by(|a, b| a.date.cmp(&b.date));
+        crate::ledger::recalc(&mut combined.rows);
+        let accounts = [("cash".to_string(), cash), ("bank".to_string(), bank)];
+        let series = ["balance".to_string()];
+        let chart = render_chart_accounts(&combined, &None, &series, &accounts);
+        assert!(chart.contains("text(fill: rgb(\"#2a6fdb\"), \"cash Balance\")"));
+        assert!(chart.contains("text(fill: rgb(\"#d1495b\"), \"bank Balance\")"));
+        assert!(chart.contains("text(fill: rgb(\"#24292f\"), \"Total Balance\")"));
+        assert!(chart.contains("(((0, 500), (1, 2000),), \"20.00\", rgb(\"#d1495b\"))"));
+        assert!(chart.contains("((0, 0), (0, 500), (1, 15500), (1, 17000)"));
+        assert!(chart.contains("\"351.65\", rgb(\"#24292f\")"));
+        assert!(!render_chart_accounts(&combined, &None, &["debit".to_string()], &accounts).contains("Total Balance"));
+        let source = render_typst_accounts(&combined, "cash+bank.md", &None, &series, &accounts);
+        typst_compiles(&source);
+        if process::Command::new("typst").arg("--version").output().is_ok() {
+            assert!(graph_png_accounts(&combined, &None, &series, &accounts).unwrap().unwrap().starts_with(b"\x89PNG"));
+        }
     }
 }

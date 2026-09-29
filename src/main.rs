@@ -25,7 +25,7 @@ use std::path::Path;
 use std::{env, fs, process};
 
 use ledger::{Entry, add_entry, amount_arg, balance, delete_entry, edit_entry, entry_what, find_table, lint, load, move_entry, period, push_pending, recalc, recalc_diff, resolve, row_index, save_commit, scoped, today};
-use print::{graph_png, print_pdf};
+use print::{graph_png, graph_png_accounts, print_pdf};
 use render::{render, render_csv, render_json, render_pretty};
 use tui::{scan_accounts, tui};
 
@@ -305,6 +305,17 @@ fn cmd_balance(initial_files: &[String], args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+/// Keep each account's own running balance when charting a combined statement.
+fn chart_accounts(files: &[String], p: &Option<(String, String)>) -> Result<Vec<(String, ledger::Doc)>, String> {
+    if files.len() < 2 {
+        return Ok(vec![]);
+    }
+    files.iter().map(|file| {
+        let name = Path::new(file).file_stem().map_or(file.as_str().into(), |s| s.to_string_lossy().into_owned());
+        Ok((name, scoped(load(file)?, p)))
+    }).collect()
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -414,7 +425,9 @@ fn run() -> Result<(), String> {
             }
             if graph && chart::supported() {
                 let series = if series.is_empty() { vec!["balance".to_string()] } else { series };
-                if let Some(png) = graph_png(&doc, &p, &series)? {
+                let accounts = chart_accounts(&files, &p)?;
+                let png = if accounts.is_empty() { graph_png(&doc, &p, &series)? } else { graph_png_accounts(&doc, &p, &series, &accounts)? };
+                if let Some(png) = png {
                     chart::display(&png).map_err(|e| format!("graph: {e}"))?;
                 }
             }
@@ -433,7 +446,9 @@ fn run() -> Result<(), String> {
             let doc = scoped(doc, &p);
             if out.is_some() || chart::supported() {
                 let series = if series.is_empty() { vec!["balance".to_string()] } else { series };
-                if let Some(png) = graph_png(&doc, &p, &series)? {
+                let accounts = chart_accounts(&files, &p)?;
+                let png = if accounts.is_empty() { graph_png(&doc, &p, &series)? } else { graph_png_accounts(&doc, &p, &series, &accounts)? };
+                if let Some(png) = png {
                     if let Some(path) = out {
                         fs::write(&path, &png).map_err(|e| format!("{path}: {e}"))?;
                         println!("wrote {path}");
@@ -465,7 +480,8 @@ fn run() -> Result<(), String> {
             }
             let p = period(&words, &today())?;
             let doc = scoped(doc, &p);
-            println!("{}", print_pdf(&doc, file, &p, &series, out.as_deref())?);
+            let accounts = if series.is_empty() { vec![] } else { chart_accounts(&files, &p)? };
+            println!("{}", print_pdf(&doc, file, &p, &series, &accounts, out.as_deref())?);
             return Ok(());
         }
         "recalc" => match rest {
