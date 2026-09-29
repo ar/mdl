@@ -29,6 +29,8 @@ mdl cash                       # bordered table with totals (the .md is optional
 mdl cash --markdown            # the original Markdown table
 mdl cash show 2026-09          # a monthly statement
 mdl cash.md print --graph      # cash.pdf, with the balance charted
+mdl cash.md show --graph       # statement with the same chart inline in Ghostty/Kitty
+mdl cash.md graph -o cash.png  # save the chart as a PNG
 ```
 
 The default display uses the interactive screen's table borders and totals, preserving the
@@ -165,7 +167,7 @@ no longer evaluated or checked by `lint`.
 
 `mdl <file> print [--graph [balance|debit|credit]...] [period]` typesets the statement with [Typst](https://typst.app),
 a single-binary, open-source (Apache 2.0) typesetter. It is the only external tool
-`mdl` needs, and only for `print`.
+`mdl` needs, and only for PDF or graph rendering.
 
 ### Install Typst
 
@@ -201,7 +203,7 @@ Check it:
 typst --version
 ```
 
-`mdl` looks for `typst` on the `PATH`; if it is missing, `print` says so.
+`mdl` looks for `typst` on the `PATH`; if it is missing, `print` and graph rendering say so.
 
 ### Fonts
 
@@ -234,3 +236,13 @@ each entry's amount instead of the balance, for an account that records, say, bi
 payments as single entries (the balance only ever grows, the amounts are the story);
 both words chart both, each in its own colour. Typst draws
 it from the ledger's own numbers, with nothing more to install.
+
+### Inline and PNG graphs
+
+`mdl <file> show --graph [balance|debit|credit]... [period]` displays the normal
+statement followed by the PDF chart in Ghostty or Kitty. Other terminals still show
+the statement. `mdl <file> graph [balance|debit|credit]... [period]` displays just the
+chart; use `-o chart.png` to save it, including on terminals without inline graphics.
+The series and period work the same way as `print --graph`. All three use the same
+Typst chart definition and ledger data, so the graph's shape, colours, ticks and
+labels stay aligned. Inline display is disabled inside tmux and screen.

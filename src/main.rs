@@ -14,6 +14,7 @@
 //! save also commits the file and pushes best-effort. The interactive screen fetches
 //! on the way in and syncs on the way out. See git.rs and tui.rs.
 mod git;
+mod chart;
 mod ledger;
 mod print;
 mod render;
@@ -24,7 +25,7 @@ use std::path::Path;
 use std::{env, fs, process};
 
 use ledger::{Entry, add_entry, amount_arg, balance, delete_entry, edit_entry, entry_what, find_table, lint, load, move_entry, period, push_pending, recalc, recalc_diff, resolve, row_index, save_commit, scoped, today};
-use print::print_pdf;
+use print::{graph_png, print_pdf};
 use render::{render, render_csv, render_json, render_pretty};
 use tui::{scan_accounts, tui};
 
@@ -41,6 +42,10 @@ Read
   mdl <file> [show] [--pretty|--markdown|--json|--csv] [period]
                                        the statement, with borders and totals
                                        by default; --markdown uses a GFM table
+  mdl <file> show --graph [balance|debit|credit]... [period]
+                                       show the statement and an inline chart
+  mdl <file> graph [-o <png>] [balance|debit|credit]... [period]
+                                       show or save the same chart as in the PDF
   mdl <file> print [-o <pdf>] [--graph [balance|debit|credit]...] [period]
                                        typeset to <file>.pdf, or <pdf>; --graph
                                        charts the balance, or each entry's amounts
@@ -335,8 +340,8 @@ fn run() -> Result<(), String> {
         _ => {}
     }
     // More accounts may follow the first (a shell glob, say): every word up to the
-    // command that names an existing file. show and print combine them.
-    const COMMANDS: [&str; 12] = ["show", "print", "lint", "balance", "recalc", "debit", "credit", "note", "edit", "move", "flag", "delete"];
+    // command that names an existing file. show, print and graph combine them.
+    const COMMANDS: [&str; 13] = ["show", "print", "graph", "lint", "balance", "recalc", "debit", "credit", "note", "edit", "move", "flag", "delete"];
     let n = 1 + args[1..].iter().take_while(|a| !COMMANDS.contains(&a.as_str()) && Path::new(&resolve(a)).is_file()).count();
     let files: Vec<String> = args[..n].iter().map(|f| resolve(f)).collect();
     // Display flags and period selectors imply `show`; validation stays in the
@@ -354,13 +359,13 @@ fn run() -> Result<(), String> {
     let combined;
     let file = if files.len() == 1 {
         &files[0]
-    } else if cmd == "show" || cmd == "print" {
+    } else if cmd == "show" || cmd == "print" || cmd == "graph" {
         // ponytail: the PDF is named after every stem; a long glob makes a long name
         let stems: Vec<String> = files.iter().map(|f| Path::new(f).file_stem().unwrap_or_default().to_string_lossy().into_owned()).collect();
         combined = Path::new(&files[0]).with_file_name(stems.join("+")).with_extension("md").to_string_lossy().into_owned();
         &combined
     } else {
-        bad(&format!("{cmd} takes one account; only show and print combine several"))
+        bad(&format!("{cmd} takes one account; only show, print and graph combine several"))
     };
     if cmd == "edit" && rest.is_empty() {
         return cmd_edit(file);
@@ -374,6 +379,8 @@ fn run() -> Result<(), String> {
             return if errs.is_empty() { Ok(()) } else { Err(errs.join("\n")) };
         }
         "show" => {
+            let graph = rest.iter().any(|a| a == "--graph");
+            let series: Vec<String> = if graph { rest.iter().filter(|a| ["balance", "debit", "credit"].contains(&a.as_str())).cloned().collect() } else { vec![] };
             let json = rest.iter().any(|a| a == "--json");
             let csv = rest.iter().any(|a| a == "--csv");
             let markdown = rest.iter().any(|a| a == "--markdown");
@@ -381,9 +388,16 @@ fn run() -> Result<(), String> {
             if json as u8 + csv as u8 + markdown as u8 + explicit_pretty as u8 > 1 {
                 bad("show: choose only one of --pretty, --markdown, --json, or --csv");
             }
+            if graph && (json || csv || markdown) {
+                bad("show: --graph requires the default or --pretty output");
+            }
             let pretty = !json && !csv && !markdown;
-            let words: Vec<String> = rest.iter().filter(|a| !["--json", "--csv", "--pretty", "--markdown"].contains(&a.as_str())).cloned().collect();
-            let doc = scoped(doc, &period(&words, &today())?);
+            let words: Vec<String> = rest.iter().filter(|a| {
+                !["--json", "--csv", "--pretty", "--markdown"].contains(&a.as_str())
+                    && !(graph && ["--graph", "balance", "debit", "credit"].contains(&a.as_str()))
+            }).cloned().collect();
+            let p = period(&words, &today())?;
+            let doc = scoped(doc, &p);
             if json {
                 print!("{}", render_json(doc.title().map(|t| t[2..].trim()), &doc.rows));
             } else if csv {
@@ -397,6 +411,41 @@ fn run() -> Result<(), String> {
                 } else {
                     render(&doc.header, &doc.rows)
                 });
+            }
+            if graph && chart::supported() {
+                let series = if series.is_empty() { vec!["balance".to_string()] } else { series };
+                if let Some(png) = graph_png(&doc, &p, &series)? {
+                    chart::display(&png).map_err(|e| format!("graph: {e}"))?;
+                }
+            }
+            return Ok(());
+        }
+        "graph" => {
+            let mut rest = rest.to_vec();
+            let out = match rest.iter().position(|w| w == "-o") {
+                Some(i) if i + 1 < rest.len() => Some(rest.drain(i..i + 2).nth(1).unwrap()),
+                Some(_) => bad("graph: -o needs a PNG file name"),
+                None => None,
+            };
+            let series: Vec<String> = rest.iter().filter(|w| ["balance", "debit", "credit"].contains(&w.as_str())).cloned().collect();
+            let words: Vec<String> = rest.into_iter().filter(|w| !["balance", "debit", "credit"].contains(&w.as_str())).collect();
+            let p = period(&words, &today())?;
+            let doc = scoped(doc, &p);
+            if out.is_some() || chart::supported() {
+                let series = if series.is_empty() { vec!["balance".to_string()] } else { series };
+                if let Some(png) = graph_png(&doc, &p, &series)? {
+                    if let Some(path) = out {
+                        fs::write(&path, &png).map_err(|e| format!("{path}: {e}"))?;
+                        println!("wrote {path}");
+                    }
+                    if chart::supported() {
+                        chart::display(&png).map_err(|e| format!("graph: {e}"))?;
+                    }
+                } else {
+                    return Err("no graph data for the selected period and series".into());
+                }
+            } else {
+                println!("Inline graphics need Ghostty or Kitty; use -o chart.png to save the graph.");
             }
             return Ok(());
         }

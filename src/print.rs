@@ -264,6 +264,32 @@ pub fn print_pdf(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[
     Ok(format!("wrote {}", pdf.display()))
 }
 
+/// Render the same Typst chart used by the PDF as a standalone PNG.
+pub fn graph_png(doc: &Doc, p: &Option<(String, String)>, series: &[String]) -> Result<Option<Vec<u8>>, String> {
+    if doc.rows.is_empty() {
+        return Ok(None);
+    }
+    let chart = render_chart(doc, p, series);
+    if chart.is_empty() {
+        return Ok(None);
+    }
+    let source = format!(
+        "#set page(width: 18cm, height: 9cm, margin: (x: 0.4cm, y: 0.3cm), fill: white)\n#set text(font: (\"Helvetica Neue\", \"Libertinus Serif\"), 10pt)\n{chart}"
+    );
+    let mut child = process::Command::new("typst")
+        .args(["compile", "--format", "png", "-", "-"])
+        .stdin(process::Stdio::piped())
+        .stdout(process::Stdio::piped())
+        .spawn()
+        .map_err(|e| format!("typst: {e} (install it: brew install typst)"))?;
+    child.stdin.take().unwrap().write_all(source.as_bytes()).map_err(|e| format!("typst: {e}"))?;
+    let out = child.wait_with_output().map_err(|e| format!("typst: {e}"))?;
+    if !out.status.success() {
+        return Err("typst failed to render graph".into());
+    }
+    Ok(Some(out.stdout))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -368,5 +394,16 @@ mod tests {
         doc.rows.truncate(1);
         assert!(!render_typst(&doc, "cash.md", &None, &s(&["debit", "bogus"])).contains("ledger-chart"));
         assert!(!render_typst(&doc, "cash.md", &None, &[]).contains("ledger-chart"));
+    }
+
+    #[test]
+    fn graph_png_uses_the_pdf_chart() {
+        let doc = load("cash.md").unwrap();
+        if process::Command::new("typst").arg("--version").output().is_err() {
+            return;
+        }
+        let png = graph_png(&doc, &None, &["balance".to_string()]).unwrap().unwrap();
+        assert!(png.starts_with(b"\x89PNG\r\n\x1a\n"));
+        assert!(graph_png(&doc, &None, &[]).unwrap().is_none());
     }
 }
