@@ -452,11 +452,11 @@ impl GitStatus {
 // Ctrl-H opens a read-only list of entries added during this session, newest first.
 // Up/Down and PgUp/PgDn scroll it; Esc or Ctrl-H closes it.
 //
-// Git: the screen starts a fetch in the background (unless fetched within 15 minutes)
-// and opening an account waits for it, so the account read is the current one; Ctrl-S
-// fetches + commits + pushes, and with `mdl.autocommit` every save does. Leaving the
-// screen (Esc) syncs the same way when anything is pending or unpushed, so nothing
-// stays behind on this machine; a clean, pushed tree leaves at once.
+// Git: the account picker starts a fetch in the background (unless fetched within
+// 15 minutes), and opening an account waits for it. A fixed account opens from disk
+// without fetching or syncing on exit. Ctrl-S fetches + commits + pushes in either
+// screen, and with `mdl.autocommit` every save does. Leaving the account picker
+// syncs when anything is pending or unpushed; a clean, pushed tree leaves at once.
 struct Tui {
     h: usize,
     cols: usize,
@@ -1220,7 +1220,7 @@ impl Tui {
         let previous = (self.account_git, self.autocommit);
         self.account_git = self.in_repo && git::account_in_tree(self.dir, path);
         self.autocommit = self.git_enabled() && git::autocommit(self.dir);
-        let pulled = self.pull_if_due();
+        let pulled = if self.fixed_account { Ok(String::new()) } else { self.pull_if_due() };
         // A failed merge leaves markers the parser refuses: say why.
         let (doc, offer) = match load_for_tui(path) {
             Ok(loaded) => loaded,
@@ -1423,12 +1423,11 @@ impl Tui {
         self.reload();
     }
 
-    /// Leaving the screen: like Ctrl-S (fetch, then commit and push what is pending),
-    /// but only when there is something to push; a clean, pushed tree leaves with no
-    /// round trip. A background pull still running is waited for first, so two git
-    /// operations never overlap. None: nothing was done.
+    /// Leaving the account picker: like Ctrl-S (fetch, then commit and push what is
+    /// pending), but only when there is something to push. A fixed-account screen
+    /// leaves without syncing. None: nothing was done.
     fn quit_sync(&mut self) -> Option<Result<String, String>> {
-        if !self.git_enabled() {
+        if self.fixed_account || !self.git_enabled() {
             return None;
         }
         let dir = self.dir;
@@ -2580,11 +2579,24 @@ mod tests {
             sh(dst, &["config", "commit.gpgsign", "false"]);
         };
         clone(&a);
+        // Explicit edit opens the local file and leaves pending work for mdl sync.
+        fs::write(a.join("caja.md"), cash_head(3)).unwrap();
+        let mut fixed = Tui::new();
+        fixed.dir = Box::leak(a.clone().into_boxed_path());
+        fixed.in_repo = true;
+        fixed.fixed_account = true;
+        fixed.open_path(a.join("caja.md").to_str().unwrap()).unwrap();
+        assert!(fixed.git_enabled());
+        assert!(fixed.pull_job.is_none());
+        assert!(git::fetched_ago(&a).is_none());
+        assert!(fixed.quit_sync().is_none());
+        assert!(!git::pending(&a).unwrap().is_empty());
+        assert_eq!(git::unpushed(&a), 0);
+
         let mut t = Tui::new();
         t.dir = Box::leak(a.clone().into_boxed_path());
         t.in_repo = true;
         // a fresh clone with a new account: committed and pushed on the way out
-        fs::write(a.join("caja.md"), cash_head(3)).unwrap();
         assert_eq!(t.quit_sync().unwrap().unwrap(), "no upstream branch yet; committed: mdl: update caja; pushed");
         // clean and pushed: nothing to do, no note
         assert!(t.quit_sync().is_none());

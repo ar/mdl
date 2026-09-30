@@ -73,6 +73,11 @@ table is appended, preserving its text. Existing ledgers are opened as they are.
 This session stays on that account: the account field shows only its filename
 without `.md` and cannot be changed. Ctrl-L clears the entry while keeping the
 account open. Run plain `mdl` to switch between accounts.
+
+`mdl edit <file>` opens the local account without fetching and exits without
+syncing. Use `mdl sync` or Ctrl-S when you want to sync. Plain `mdl` continues to
+fetch on entry and sync pending work on exit.
+
 The `.md` extension is optional. `mdl cash edit` remains an alias. The command
 `mdl cash edit <row> <date> <debit|-> <credit|-> <description...>` still edits a row
 directly from the command line.
