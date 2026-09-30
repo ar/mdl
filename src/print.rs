@@ -8,21 +8,35 @@ use crate::render::{grid, totals};
 
 /// A Typst string literal.
 fn typst_str(s: &str) -> String {
-    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
 }
 
-/// Typst source for the printed statement: the title as a heading, the prose around
-/// the table as plain paragraphs (Markdown markup shows literally), and the table with
-/// the totals row, then the chart of `series` (`balance`, `debit`, `credit`; none for no
-/// chart). The file's name goes in the
-/// page footer, the period (or today) in the header.
+/// Render the Markdown surrounding the ledger table. Keep Markdown syntax intact so
+/// cmarker can distinguish paragraphs, lists, links, and other formatting.
+fn render_markdown(lines: &[String]) -> String {
+    let markdown = lines.join("\n");
+    let markdown = markdown.trim_matches('\n');
+    if markdown.trim().is_empty() {
+        String::new()
+    } else {
+        format!("#cmarker.render({}, raw-typst: false, set-document-title: false)\n\n", typst_str(&markdown))
+    }
+}
+
+/// Typst source for the printed statement: the closest title above the table,
+/// Markdown after that title, the table with totals, an optional chart, and any
+/// Markdown below the table. The file's name goes in the footer; the period (or
+/// today) goes in the header.
 fn render_typst(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String]) -> String {
     render_typst_accounts(doc, file, p, series, &[])
 }
 
 fn render_typst_accounts(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String], accounts: &[(String, Doc)]) -> String {
     let name = Path::new(file).file_name().map_or(file.to_string(), |n| n.to_string_lossy().into_owned());
-    let title = doc.title().map_or(name.as_str(), |t| t[2..].trim());
+    let title_line = doc.lines[..doc.start].iter().rposition(|line| line.starts_with("# "));
+    let title = title_line.map_or(name.as_str(), |i| doc.lines[i][2..].trim());
+    let before = render_markdown(&doc.lines[title_line.map_or(0, |i| i + 1)..doc.start]);
+    let after = render_markdown(&doc.lines[doc.end..]);
     let when = match p {
         Some((a, b)) => typst_str(&period_label(a, b)),
         None => "datetime.today().display(\"[year]-[month]-[day]\")".to_string(),
@@ -49,24 +63,10 @@ fn render_typst_accounts(doc: &Doc, file: &str, p: &Option<(String, String)>, se
         file = typst_str(&name),
         when = when,
     );
-    // prose: every line outside the table but the title, paragraphs split on blank lines
-    let prose = |lines: &[String]| -> String {
-        let mut paras = vec![];
-        let mut cur = vec![];
-        for l in lines.iter().chain([&String::new()]) {
-            let l = l.trim();
-            if l.is_empty() {
-                if !cur.is_empty() {
-                    paras.push(format!("#{}\n\n", typst_str(&cur.join(" "))));
-                    cur.clear();
-                }
-            } else if !l.starts_with("# ") {
-                cur.push(l);
-            }
-        }
-        paras.concat()
-    };
-    out += &prose(&doc.lines[..doc.start]);
+    if !before.is_empty() || !after.is_empty() {
+        out = format!("#import \"@preview/cmarker:0.1.10\"\n{out}");
+    }
+    out += &before;
     let cells = |r: &[String], bold: bool| -> String {
         let c: Vec<String> = r.iter().map(|c| if bold { format!("strong({})", typst_str(c)) } else { typst_str(c) }).collect();
         format!("  {},\n", c.join(", "))
@@ -92,7 +92,7 @@ fn render_typst_accounts(doc: &Doc, file: &str, p: &Option<(String, String)>, se
     if !series.is_empty() && !doc.rows.is_empty() {
         out += &if accounts.is_empty() { render_chart(doc, p, series) } else { render_chart_accounts(doc, p, series, accounts) };
     }
-    out += &prose(&doc.lines[doc.end..]);
+    out += &after;
     out
 }
 
@@ -338,8 +338,9 @@ mod tests {
         let p = Some(("2026-08".to_string(), "2026-09".to_string()));
         assert!(render_typst(&doc, "cash.md", &p, &[]).contains("#h(1fr) #\"2026-08 – 2026-09\"\n"));
         assert!(t.contains("= #\"Cash\"\n"));
-        assert!(t.contains("#\"Ledger of the Cash account. Balance = Σ debit − Σ credit.\"\n\n"));
-        assert!(t.contains("#\"Free notes below the table are left untouched.\"\n\n"));
+        assert!(t.contains("#import \"@preview/cmarker:0.1.10\""));
+        assert!(t.contains("#cmarker.render(\"Ledger of the Cash account. Balance = Σ debit − Σ credit.\", raw-typst: false, set-document-title: false)"));
+        assert!(t.contains("#cmarker.render(\"Free notes below the table are left untouched.\", raw-typst: false, set-document-title: false)"));
         assert!(t.contains("strong(\"Sale \\\"over\\\" the counter \\\\ rest\")"));
         assert!(t.contains("  \"2026-09-05\", \"Supplier payment\", \"\", \"81.00\", \"277.00\",\n"));
         assert!(t.contains("strong(\"\"), strong(\"\"), strong(\"1510.50\"), strong(\"1178.85\"), strong(\"\"),\n"));
@@ -347,12 +348,53 @@ mod tests {
         typst_compiles(&t);
     }
 
+    #[test]
+    fn print_starts_at_the_closest_title_and_preserves_markdown() {
+        let mut doc = load("cash.md").unwrap();
+        doc.lines.splice(0..2, [
+            "# Old notes".to_string(),
+            "Ignore *this* section.".to_string(),
+            "".to_string(),
+            "# Cash statement".to_string(),
+            "".to_string(),
+            "## Details".to_string(),
+            "- **Important** [link](https://example.org)".to_string(),
+            "- second item".to_string(),
+            "".to_string(),
+        ]);
+        doc.start += 7;
+        doc.end += 7;
+        doc.lines.extend(["".to_string(), "## Follow-up".to_string(), "`code`".to_string()]);
+        let t = render_typst(&doc, "cash.md", &None, &[]);
+        assert!(t.contains("= #\"Cash statement\""));
+        assert!(!t.contains("Old notes"));
+        assert!(!t.contains("Ignore *this*"));
+        assert!(t.contains("## Details\\n- **Important** [link](https://example.org)\\n- second item"));
+        assert!(t.contains("## Follow-up\\n`code`"));
+        assert!(t.find("## Details").unwrap() < t.find("#table(").unwrap());
+        assert!(t.find("## Follow-up").unwrap() > t.find("#table(").unwrap());
+        typst_compiles(&t);
+    }
+
+    #[test]
+    fn print_without_notes_does_not_need_cmarker() {
+        let doc = Doc { lines: vec!["# Cash".into()], start: 1, end: 1, ..load("cash.md").unwrap() };
+        let t = render_typst(&doc, "cash.md", &None, &[]);
+        assert!(!t.contains("cmarker"));
+        typst_compiles(&t);
+    }
+
     /// With typst installed, the source compiles to a PDF.
     fn typst_compiles(t: &str) {
-        if let Ok(mut c) = process::Command::new("typst").args(["compile", "-", "-"]).stdin(process::Stdio::piped()).stdout(process::Stdio::piped()).spawn() {
+        if let Ok(mut c) = process::Command::new("typst").args(["compile", "-", "-"]).stdin(process::Stdio::piped()).stdout(process::Stdio::piped()).stderr(process::Stdio::piped()).spawn() {
             c.stdin.take().unwrap().write_all(t.as_bytes()).unwrap();
             let out = c.wait_with_output().unwrap();
-            assert!(out.status.success());
+            // The package is downloaded on first use. Keep tests usable offline;
+            // when it is installed, this checks the real PDF compilation.
+            if t.contains("@preview/cmarker:") && String::from_utf8_lossy(&out.stderr).contains("failed to download package") {
+                return;
+            }
+            assert!(out.status.success(), "{}", String::from_utf8_lossy(&out.stderr));
             assert!(out.stdout.starts_with(b"%PDF"));
         }
     }

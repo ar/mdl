@@ -172,7 +172,12 @@ no longer evaluated or checked by `lint`.
 
 `mdl <file> print [--graph [balance|debit|credit]...] [period]` typesets the statement with [Typst](https://typst.app),
 a single-binary, open-source (Apache 2.0) typesetter. It is the only external tool
-`mdl` needs, and only for PDF or graph rendering.
+`mdl` needs, and only for PDF or graph rendering. When the file has text outside the
+ledger table, printing uses the closest `#` title above the table, includes the
+Markdown between that title and the table and after the table, and ignores text
+before the title. Without a title above the table, the filename is used as the title.
+The surrounding Markdown is rendered by the pinned [cmarker](https://typst.app/universe/package/cmarker/)
+Typst package, which Typst downloads on first use and caches for later prints.
 
 ### Install Typst
 
