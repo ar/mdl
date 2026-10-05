@@ -457,6 +457,18 @@ impl GitStatus {
 // without fetching or syncing on exit. Ctrl-S fetches + commits + pushes in either
 // screen, and with `mdl.autocommit` every save does. Leaving the account picker
 // syncs when anything is pending or unpushed; a clean, pushed tree leaves at once.
+/// A counterpart is a new entry; the source is retained for cancellation and return.
+struct Counterpart {
+    source: String,
+    row: usize,
+    date: String,
+    transfer: bool,
+    choosing: bool,
+    origin: Option<(String, Doc)>,
+    scope: (bool, bool),
+    top: usize,
+}
+
 struct Tui {
     h: usize,
     cols: usize,
@@ -488,6 +500,7 @@ struct Tui {
     /// go right below it instead.
     editing: Option<usize>,
     insert: bool,
+    counterpart: Option<Counterpart>,
     /// Mouse button down on an entry: where it was (index, date) when pressed. The
     /// entry follows the pointer in memory; the release saves.
     drag: Option<(usize, String)>,
@@ -546,6 +559,7 @@ impl Tui {
             sel: None,
             editing: None,
             insert: false,
+            counterpart: None,
             drag: None,
             msg: String::new(),
             posts: vec![],
@@ -709,15 +723,20 @@ impl Tui {
             format!("/{q}   {hint}")
         } else if !self.msg.is_empty() {
             self.msg.clone()
+        } else if let Some(draft) = self.counterpart.as_ref().filter(|d| !d.choosing) {
+            format!("{} to {}: Enter saves, Tab next, Esc cancels",
+                if draft.transfer { "Transfer counterpart" } else { "Reversal" }, self.stem())
         } else if let Some(i) = self.editing {
             let what = if self.insert { "new row below row" } else { "editing row" };
             format!("{what} {}: Enter saves, Esc cancels", i + 1)
         } else if let Some(i) = self.sel {
-            format!("row {}: Enter edit, n new below, Space flag, Ctrl-D delete, Shift-Up/Down move, Esc back", i + 1)
+            format!("row {}: Enter edit, n new below, t transfer, r reverse, Space flag, Ctrl-D delete, Shift-Up/Down move, Esc back", i + 1)
         } else if self.focus == 4 {
             "balance to reach: Enter adds the debit or credit that gets there (empty: a note)".into()
         } else if let Some(strip) = self.completion_strip() {
             strip
+        } else if self.counterpart.as_ref().is_some_and(|d| d.choosing) {
+            "Destination account: Enter chooses, Esc cancels".into()
         } else {
             String::new()
         };
@@ -729,16 +748,20 @@ impl Tui {
             out.extend(status.chars().take(self.cols));
         }
         if self.panel_expanded() {
-            let title = match self.editing {
+            let title = if let Some(draft) = &self.counterpart {
+                if draft.transfer { format!("Transfer counterpart from {}", draft.source.trim_end_matches(".md")) }
+                else { format!("Reverse row {}", draft.row + 1) }
+            } else { match self.editing {
                 Some(i) if self.insert => format!("Insert below row {}", i + 1),
                 Some(i) => format!("Editing row {}", i + 1),
                 None => "New entry".into(),
-            };
+            }};
             let width = self.w.iter().sum::<usize>() + 16;
             let title: String = title.chars().take(width.saturating_sub(5)).collect();
             out += &format!("\r\n\x1b[2K\x1b[2m╭─ {title} {}╮\x1b[0m", "─".repeat(width.saturating_sub(title.chars().count() + 5)));
             out += "\r\n\x1b[2K\x1b[2m│ \x1b[0m";
-            let first = if self.editing.is_some() { "Date" } else { "Account" };
+            let first = if self.counterpart.as_ref().is_some_and(|d| d.choosing) { "To account" }
+                else if self.edit_form() { "Date" } else { "Account" };
             for (i, label) in [first, "Description", "Debit", "Credit", "Balance"].iter().enumerate() {
                 let label: String = label.chars().take(self.w[i]).collect();
                 let style = if i == self.focus { "\x1b[1;36m" } else { "\x1b[2m" };
@@ -749,9 +772,9 @@ impl Tui {
         let view = |i: usize| {
             let (f, w) = (&self.fields[i], self.w[i]);
             let cur = if i == self.focus { self.cur() }
-                else if i == 0 && self.editing.is_some() { 0 }
+                else if i == 0 && self.edit_form() { 0 }
                 else { usize::MAX };
-            if i == 0 && self.editing.is_some() {
+            if i == 0 && self.edit_form() {
                 (f.chars().take(w).collect(), cur.min(9))
             } else if i >= 2 { amount_view(f, w, i == self.focus, cur) } else { field_view(f, w, cur) }
         };
@@ -769,7 +792,7 @@ impl Tui {
         out += &self.footer();
         if let Some(q) = &self.search {
             out += &format!("\x1b[{};{}H\x1b[?25h", self.view + 1, (2 + q.chars().count()).min(self.cols));
-        } else if self.sel.is_none() || self.editing.is_some() {
+        } else if self.sel.is_none() || self.edit_form() {
             let col = cell_start(&self.w, self.focus) + view(self.focus).1;
             out += &format!("\x1b[{};{}H\x1b[?25h", self.field_row(), col + 1);
         }
@@ -781,12 +804,15 @@ impl Tui {
     }
 
     fn history_view(&self) -> String {
+        let show_account = !self.fixed_account
+            || self.counterpart.as_ref().is_some_and(|d| d.transfer)
+            || self.account.as_ref().is_some_and(|(current, _)| self.posts.iter().any(|(path, _)| path != current));
         let mut headers = vec!["Date", "Account", "Description", "Debit", "Credit"];
-        if self.fixed_account { headers.remove(1); }
+        if !show_account { headers.remove(1); }
         let rows: Vec<Vec<String>> = self.posts.iter().rev().map(|(path, e)| {
             let mut row = vec![e.date.clone(), path.trim_end_matches(".md").to_string(),
                 e.desc.clone(), fmt_col(e.debit), fmt_col(e.credit)];
-            if self.fixed_account { row.remove(1); }
+            if !show_account { row.remove(1); }
             row
         }).collect();
         let desc = headers.len() - 3;
@@ -806,7 +832,7 @@ impl Tui {
         let line = |cells: &[String], header: bool| {
             let mut out = String::from("│");
             for (i, (cell, &w)) in cells.iter().zip(&widths).enumerate() {
-                let text = if !self.fixed_account && i == 1 { clipped_tail(cell, w) } else { clipped(cell, w) };
+                let text = if show_account && i == 1 { clipped_tail(cell, w) } else { clipped(cell, w) };
                 if !header && i >= cells.len() - 2 {
                     out += &format!(" {text:>w$} │");
                 } else {
@@ -845,8 +871,9 @@ impl Tui {
         let indicator: String = indicator.chars().take(self.cols).collect();
         let room = self.cols.saturating_sub(indicator.chars().count() + 2);
         let hint = if self.history_scroll.is_some() { "↑/↓ scroll · PgUp/PgDn · Ctrl-H/Esc back" }
-            else if self.editing.is_some() { "Enter save · Tab next · Ctrl-H posts · Esc cancel" }
-            else if self.sel.is_some() { "Enter edit · n insert · / search · Ctrl-H posts · Esc back" }
+            else if self.counterpart.as_ref().is_some_and(|d| d.choosing) { "Enter choose account · Tab matches · Esc cancel" }
+            else if self.edit_form() { "Enter save · Tab next · Ctrl-H posts · Esc cancel" }
+            else if self.sel.is_some() { "Enter edit · t transfer · r reverse · n insert · / search · Ctrl-H posts · Esc back" }
             else { "Enter next / save · Tab next · Ctrl-H posts · Ctrl-S sync" };
         let hint: String = hint.chars().take(room).collect();
         out += &format!("\x1b[2m{hint:<room$}\x1b[0m");
@@ -936,14 +963,14 @@ impl Tui {
     /// and one entered with a value in it is "selected": Backspace clears it, typing
     /// replaces it.
     fn set_focus(&mut self, f: usize) {
-        if self.fixed_account && self.editing.is_none() && f == 0 {
+        if self.fixed_account && !self.edit_form() && f == 0 {
             return;
         }
         if self.focus >= 2 && self.focus != f && !self.finish_amount() {
             return;
         }
         self.focus = f;
-        self.cur = if f == 0 && self.editing.is_some() { 0 } else { usize::MAX };
+        self.cur = if f == 0 && self.edit_form() { 0 } else { usize::MAX };
         self.select = f >= 2 && !self.fields[f].is_empty();
     }
 
@@ -953,10 +980,15 @@ impl Tui {
     /// is empty or in use as a date (an edit).
     fn completions(&self) -> Vec<String> {
         let q = self.fields[0].trim();
-        if self.fixed_account || self.editing.is_some() || q.is_empty() {
+        if (self.fixed_account && self.counterpart.is_none()) || self.edit_form() || q.is_empty() {
             return vec![];
         }
-        account_matches(q, &self.accounts)
+        if let Some(draft) = &self.counterpart {
+            let accounts: Vec<String> = self.accounts.iter().filter(|p| **p != draft.source).cloned().collect();
+            account_matches(q, &accounts)
+        } else {
+            account_matches(q, &self.accounts)
+        }
     }
 
     /// The account field's text names an account outright (a path or a file name).
@@ -976,7 +1008,7 @@ impl Tui {
     /// goes on, as for any exact name). False when the key should do what it normally
     /// does.
     fn cycle_pick(&mut self, forward: bool) -> bool {
-        if self.focus != 0 || self.editing.is_some() || self.exact_account() {
+        if self.focus != 0 || self.edit_form() || self.exact_account() {
             return false;
         }
         let names = self.completions();
@@ -998,7 +1030,7 @@ impl Tui {
     /// The status line while typing an account name: the matches, the picked one in
     /// reverse video, as many as fit the width. None when there is nothing to show.
     fn completion_strip(&self) -> Option<String> {
-        if self.focus != 0 || self.editing.is_some() || self.sel.is_some() {
+        if self.focus != 0 || self.edit_form() || self.sel.is_some() {
             return None;
         }
         let names = self.completions();
@@ -1037,7 +1069,7 @@ impl Tui {
         let amount = |s: &str| parse_amount(s.trim()).unwrap_or(0);
         let debit_done = self.focus == 2 && amount(&self.fields[2]) != 0 && amount(&self.fields[3]) == 0;
         let no_amount = amount(&self.fields[2]) == 0 && amount(&self.fields[3]) == 0;
-        match (self.editing.is_some(), self.focus) {
+        match (self.edit_form(), self.focus) {
             (false, 0) => self.open(),
             (_, 3) if no_amount => self.set_focus(4),
             (false, 3 | 4) => self.add(),
@@ -1073,8 +1105,12 @@ impl Tui {
         self.cur.min(self.fields[self.focus].chars().count())
     }
 
+    fn edit_form(&self) -> bool {
+        self.editing.is_some() || self.counterpart.as_ref().is_some_and(|d| !d.choosing)
+    }
+
     fn date_field(&self) -> bool {
-        self.editing.is_some() && self.focus == 0
+        self.edit_form() && self.focus == 0
     }
 
     /// Date digits overwrite fixed slots; other text is inserted at the cursor.
@@ -1151,6 +1187,11 @@ impl Tui {
     pub fn save(&self, what: &str) -> Result<String, String> {
         let (path, doc) = self.account.as_ref().ok_or("account?")?;
         doc.save(path)?;
+        self.save_git(what)
+    }
+
+    fn save_git(&self, what: &str) -> Result<String, String> {
+        let (path, _) = self.account.as_ref().ok_or("account?")?;
         if !self.git_enabled() {
             return Ok(String::new());
         }
@@ -1291,6 +1332,117 @@ impl Tui {
         }
     }
 
+    fn start_counterpart(&mut self, transfer: bool) {
+        let Some(i) = self.sel else { return };
+        let e = &self.rows()[i];
+        if e.debit == 0 && e.credit == 0 {
+            self.msg = "select an entry with an amount to transfer or reverse".into();
+            return;
+        }
+        let date = e.date.clone();
+        let desc = if transfer { e.desc.clone() } else { format!("({})", e.desc) };
+        let source = self.account.as_ref().unwrap().0.clone();
+        self.fields = [if transfer { String::new() } else { date.clone() }, desc,
+            fmt_col(e.credit), fmt_col(e.debit), String::new()];
+        self.counterpart = Some(Counterpart {
+            source, row: i, date, transfer, choosing: transfer, origin: None,
+            scope: (self.account_git, self.autocommit), top: self.top,
+        });
+        self.sel = None;
+        self.select = false;
+        self.focus = if transfer { 0 } else { 1 };
+        self.cur = usize::MAX;
+        self.msg.clear();
+        self.pick = (String::new(), 0);
+    }
+
+    fn choose_counterpart_key(&mut self, key: Key) {
+        match key {
+            Key::Esc | Key::Clear => self.cancel_edit(),
+            Key::Enter => self.choose_counterpart_account(),
+            Key::Char(c) => { self.insert_char(c); self.msg.clear(); }
+            Key::Backspace => { self.erase(true); self.msg.clear(); }
+            Key::Delete => self.erase(false),
+            Key::Next => { self.cycle_pick(true); }
+            Key::Prev => { self.cycle_pick(false); }
+            Key::Left => self.cur = self.cur().saturating_sub(1),
+            Key::Right => self.cur = (self.cur() + 1).min(self.fields[0].chars().count()),
+            Key::Home => self.cur = 0,
+            Key::End => self.cur = usize::MAX,
+            _ => {}
+        }
+    }
+
+    fn choose_counterpart_account(&mut self) {
+        let _ = self.finish_pull();
+        let id = self.fields[0].trim();
+        let target = match self.completions().get(self.pick()) {
+            Some(name) if !self.exact_account() => Ok(format!("{name}.md")),
+            _ => resolve_account(id, &self.accounts),
+        };
+        let result = target.and_then(|path| {
+            let source = &self.counterpart.as_ref().unwrap().source;
+            if fs::canonicalize(&path).ok() == fs::canonicalize(source).ok() {
+                return Err("choose a different destination account".into());
+            }
+            let (doc, offer) = load_for_tui(&path)?;
+            if offer.is_some() {
+                return Err("destination balances need recalculation; open that account first".into());
+            }
+            let from = if doc.header.first().is_some_and(|h| h.trim().eq_ignore_ascii_case("fecha")) { "de" } else { "from" };
+            let account = Path::new(source).file_stem().unwrap_or_default().to_string_lossy();
+            self.fields[1].push_str(&format!(" ({from} {account})"));
+            // Keep the source available without changing or writing it.
+            let origin = self.account.replace((path.clone(), doc));
+            let draft = self.counterpart.as_mut().unwrap();
+            draft.origin = origin;
+            draft.choosing = false;
+            self.fields[0] = draft.date.clone();
+            self.account_git = self.in_repo && git::account_in_tree(self.dir, &path);
+            self.autocommit = self.git_enabled() && git::autocommit(self.dir);
+            self.set_focus(if self.fields[2].is_empty() { 3 } else { 2 });
+            self.msg.clear();
+            self.top = 0;
+            self.rebuild();
+            Ok(())
+        });
+        if let Err(e) = result { self.msg = e; }
+    }
+
+    fn submit_counterpart(&mut self) {
+        let date = self.fields[0].trim().to_string();
+        let desc = self.fields[1].trim().to_string();
+        let balance = self.rows().iter().take_while(|e| e.date <= date)
+            .map(|e| e.debit - e.credit).sum();
+        let result = self.amounts(balance).and_then(|(d, c)| {
+            let (path, doc) = self.account.as_mut().ok_or("account?")?;
+            let previous = doc.rows.clone();
+            let i = add_entry(&mut doc.rows, date, d, c, desc.clone())?;
+            if let Err(e) = doc.save(path) {
+                doc.rows = previous;
+                return Err(e);
+            }
+            // A git failure after the file was saved must not leave a retryable draft
+            // that would post the same counterpart a second time.
+            let note = self.save_git(&entry_what(d, c, &desc))
+                .unwrap_or_else(|e| format!("saved locally; {e}"));
+            Ok((i, note))
+        });
+        match result {
+            Ok((i, note)) => {
+                self.record_post(i);
+                let transfer = self.counterpart.as_ref().unwrap().transfer;
+                let destination = self.stem();
+                self.cancel_edit();
+                if !transfer { self.sel = Some(i); }
+                self.msg = format!("{} added to {destination}{}", if transfer { "transfer counterpart" } else { "reversal" },
+                    if note.is_empty() { String::new() } else { format!("; {note}") });
+                self.rebuild();
+            }
+            Err(e) => self.msg = e,
+        }
+    }
+
     fn start_edit(&mut self, i: usize) {
         let e = &self.rows()[i];
         self.fields = [e.date.clone(), e.desc.clone(), fmt_col(e.debit), fmt_col(e.credit), String::new()];
@@ -1309,11 +1461,23 @@ impl Tui {
     }
 
     fn cancel_edit(&mut self) {
+        if let Some(draft) = self.counterpart.take() {
+            if let Some(origin) = draft.origin {
+                self.account = Some(origin);
+                (self.account_git, self.autocommit) = draft.scope;
+            }
+            self.sel = Some(draft.row);
+            self.top = draft.top;
+            self.offer_recalc = false;
+            self.msg.clear();
+        }
         self.editing = None;
         self.insert = false;
         self.fields = [self.stem(), String::new(), String::new(), String::new(), String::new()];
         self.focus = usize::from(self.fixed_account);
         self.cur = usize::MAX;
+        self.select = false;
+        self.rebuild();
     }
 
     fn record_post(&mut self, i: usize) {
@@ -1325,6 +1489,10 @@ impl Tui {
     }
 
     fn submit_edit(&mut self) {
+        if self.counterpart.is_some() {
+            self.submit_counterpart();
+            return;
+        }
         let Some(i) = self.editing else { return };
         let insert = self.insert;
         let date = self.fields[0].trim().to_string();
@@ -1614,6 +1782,18 @@ impl Tui {
             self.history_scroll = Some(0);
             return true;
         }
+        if self.counterpart.as_ref().is_some_and(|d| d.choosing) {
+            self.choose_counterpart_key(key);
+            return true;
+        }
+        if self.counterpart.is_some() {
+            match key {
+                Key::Clear => { self.cancel_edit(); return true; }
+                Key::Sync => { self.msg = "save or cancel the counterpart before syncing".into(); return true; }
+                Key::Click(_, y) if y != self.field_row() => return true,
+                _ => {}
+            }
+        }
         if self.offer_recalc {
             self.accept_recalc(&key);
             return true;
@@ -1639,7 +1819,7 @@ impl Tui {
         let account_before = self.fields[0].clone();
         match key {
             Key::Esc => {
-                if self.editing.is_some() {
+                if self.edit_form() {
                     self.cancel_edit();
                 } else if self.sel.is_some() {
                     self.sel = None;
@@ -1647,13 +1827,15 @@ impl Tui {
                     return false;
                 }
             }
-            Key::Char(' ') if self.sel.is_some() && self.editing.is_none() => self.flag(self.sel.unwrap()),
-            Key::Char('n') if self.sel.is_some() && self.editing.is_none() => self.start_insert(self.sel.unwrap()),
-            Key::Char('/') if self.editing.is_none() && (self.sel.is_some() || (self.focus >= 2 && self.fields[self.focus].is_empty()) || (self.focus == 1 && self.fields[1].is_empty())) => {
+            Key::Char(' ') if self.sel.is_some() && !self.edit_form() => self.flag(self.sel.unwrap()),
+            Key::Char('n') if self.sel.is_some() && !self.edit_form() => self.start_insert(self.sel.unwrap()),
+            Key::Char('t') if self.sel.is_some() && !self.edit_form() => self.start_counterpart(true),
+            Key::Char('r') if self.sel.is_some() && !self.edit_form() => self.start_counterpart(false),
+            Key::Char('/') if !self.edit_form() && (self.sel.is_some() || (self.focus >= 2 && self.fields[self.focus].is_empty()) || (self.focus == 1 && self.fields[1].is_empty())) => {
                 self.start_search()
             }
             Key::Char(c) => {
-                if self.editing.is_none() {
+                if !self.edit_form() {
                     self.sel = None;
                 }
                 if self.select {
@@ -1668,7 +1850,7 @@ impl Tui {
                 }
             }
             Key::Backspace => {
-                if self.editing.is_none() && self.sel.is_some() {
+                if !self.edit_form() && self.sel.is_some() {
                     self.sel = None;
                 } else {
                     if self.select {
@@ -1683,7 +1865,7 @@ impl Tui {
             Key::Sync => self.sync(),
             Key::Clear => self.clear(),
             Key::Prev => {
-                if self.editing.is_some() {
+                if self.edit_form() {
                     self.set_focus(self.focus.saturating_sub(1));
                 } else if let Some(i) = self.sel {
                     self.select_row(i.saturating_sub(1));
@@ -1695,7 +1877,7 @@ impl Tui {
                 }
             }
             Key::Next => {
-                if self.editing.is_some() {
+                if self.edit_form() {
                     self.set_focus((self.focus + 1).min(3));
                 } else if let Some(i) = self.sel {
                     if i + 1 < n {
@@ -1725,7 +1907,7 @@ impl Tui {
                 }
             }
             Key::Left | Key::Right | Key::Home | Key::End => {
-                if self.sel.is_none() || self.editing.is_some() {
+                if self.sel.is_none() || self.edit_form() {
                     let n = self.fields[self.focus].chars().count();
                     self.cur = if self.date_field() {
                         let cur = self.cur().min(9);
@@ -1757,11 +1939,11 @@ impl Tui {
                             self.set_focus(i);
                         }
                     }
-                    if self.editing.is_none() {
+                    if !self.edit_form() {
                         self.sel = None;
                     }
                 } else if let Some(i) = self.entry_at(y) {
-                    if self.editing.is_some() {
+                    if self.edit_form() {
                         self.cancel_edit();
                     }
                     self.select_row(i);
@@ -1874,6 +2056,132 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn transfer_counterparts_keep_the_source_and_convert_the_amount() {
+        for (fixed, spanish) in [(false, false), (false, true), (true, false), (true, true)] {
+            let dir = std::env::temp_dir().join(format!("mdl-transfer-{fixed}-{spanish}-{}", std::process::id()));
+            fs::create_dir_all(&dir).unwrap();
+            let source = dir.join("source.md").to_str().unwrap().to_string();
+            let destination = dir.join("destination.md").to_str().unwrap().to_string();
+            let original = cash_head(5);
+            fs::write(&source, &original).unwrap();
+            let destination_original = if spanish {
+                original.replace("Date", "fEcHa").replace("Description", "Descripción")
+                    .replace("Debit", "Debe").replace("Credit", "Haber").replace("Balance", "Saldo")
+            } else { original.clone() };
+            let suffix = if spanish { "de source" } else { "from source" };
+            let sale_desc = format!("Counter sale ({suffix})");
+            let coffee_desc = format!("Coffee ({suffix})");
+            fs::write(&destination, &destination_original).unwrap();
+            let mut t = Tui::new();
+            t.in_repo = false;
+            t.fixed_account = fixed;
+            t.accounts = vec![source.clone(), destination.clone()];
+            t.open_path(&source).unwrap();
+            t.sel = Some(1); // debit 150.00
+            t.handle(Key::Char('t'));
+            assert_eq!((t.focus, t.fields[1].as_str(), t.fields[2].as_str(), t.fields[3].as_str()),
+                (0, "Counter sale", "", "150.00"));
+            assert!(without_ansi(&t.draw()).contains("Transfer counterpart from"));
+            assert_eq!(fs::read_to_string(&destination).unwrap(), destination_original);
+            for c in "dest".chars() { t.handle(Key::Char(c)); }
+            assert_eq!(t.completions().len(), 1);
+            t.handle(Key::Next); // autocomplete works even for a fixed-account session
+            t.handle(Key::Enter);
+            assert_eq!(t.account.as_ref().unwrap().0, destination);
+            assert_eq!(t.fields[1], sale_desc);
+            assert_eq!((t.focus, t.select, t.fields[0].as_str()), (3, true, "2026-09-02"));
+            for c in "150*40.50".chars() { t.handle(Key::Char(c)); }
+            t.handle(Key::Enter);
+            assert!(t.counterpart.is_none());
+            assert_eq!((t.account.as_ref().unwrap().0.as_str(), t.sel), (source.as_str(), Some(1)));
+            assert_eq!(fs::read_to_string(&source).unwrap(), original);
+            let saved = load(&destination).unwrap();
+            assert_eq!(saved.rows.len(), 6);
+            let e = &saved.rows[2];
+            assert_eq!((e.date.as_str(), e.desc.as_str(), e.debit, e.credit, e.balance),
+                ("2026-09-02", sale_desc.as_str(), 0, 607500, -592500));
+            assert_eq!(t.posts.len(), 1);
+            assert_eq!((t.posts[0].0.as_str(), t.posts[0].1.credit), (destination.as_str(), 607500));
+            assert!(without_ansi(&t.history_view()).contains("Account"));
+            // Cancellation at either stage writes nothing and returns to the source row.
+            let destination_before = fs::read_to_string(&destination).unwrap();
+            t.handle(Key::Char('t'));
+            t.handle(Key::Esc);
+            assert_eq!(t.sel, Some(1));
+            t.handle(Key::Char('t'));
+            for c in "destination".chars() { t.handle(Key::Char(c)); }
+            t.handle(Key::Enter);
+            t.handle(Key::Esc);
+            assert_eq!((t.account.as_ref().unwrap().0.as_str(), t.sel), (source.as_str(), Some(1)));
+            assert_eq!(fs::read_to_string(&source).unwrap(), original);
+            assert_eq!(fs::read_to_string(&destination).unwrap(), destination_before);
+            // A credit creates a debit counterpart, with the suggested amount intact.
+            t.sel = Some(2);
+            t.handle(Key::Char('t'));
+            for c in "destination".chars() { t.handle(Key::Char(c)); }
+            t.handle(Key::Enter);
+            assert_eq!((t.focus, t.fields[2].as_str(), t.fields[3].as_str()), (2, "12.00", ""));
+            t.handle(Key::Enter);
+            let saved = load(&destination).unwrap();
+            assert_eq!((saved.rows[4].desc.as_str(), saved.rows[4].debit, saved.rows[4].credit), (coffee_desc.as_str(), 1200, 0));
+            assert_eq!(fs::read_to_string(&source).unwrap(), original);
+            fs::remove_dir_all(dir).unwrap();
+        }
+    }
+
+    #[test]
+    fn reversal_is_an_editable_new_entry_and_transfer_rejects_invalid_destinations() {
+        let dir = std::env::temp_dir().join(format!("mdl-reversal-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let source = dir.join("source.md").to_str().unwrap().to_string();
+        let original = cash_head(5);
+        fs::write(&source, &original).unwrap();
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.accounts = vec![source.clone()];
+        t.open_path(&source).unwrap();
+        t.sel = Some(2); // credit 12.00
+        t.handle(Key::Char('r'));
+        assert_eq!((t.focus, t.fields[0].as_str(), t.fields[1].as_str(), t.fields[2].as_str(), t.fields[3].as_str()),
+            (1, "2026-09-03", "(Coffee)", "12.00", ""));
+        t.handle(Key::Esc);
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
+        t.handle(Key::Char('r'));
+        t.handle(Key::Enter); // description -> populated debit
+        t.fields[2] = "1/0".into();
+        t.handle(Key::Enter);
+        assert!(t.counterpart.is_some());
+        assert_eq!(fs::read_to_string(&source).unwrap(), original);
+        t.fields[2] = "12.00".into();
+        t.handle(Key::Enter); // save
+        let saved = load(&source).unwrap();
+        assert_eq!((saved.rows.len(), t.sel, t.posts.len()), (6, Some(3), 1));
+        assert_eq!((saved.rows[2].desc.as_str(), saved.rows[2].credit), ("Coffee", 1200));
+        assert_eq!((saved.rows[3].desc.as_str(), saved.rows[3].debit, saved.rows[3].balance), ("(Coffee)", 1200, 15000));
+        let before = fs::read_to_string(&source).unwrap();
+        t.handle(Key::Char('t'));
+        for c in source.chars() { t.handle(Key::Char(c)); }
+        t.handle(Key::Enter);
+        assert_eq!(t.msg, "choose a different destination account");
+        assert!(t.counterpart.as_ref().unwrap().choosing);
+        t.fields[0] = dir.join("missing.md").to_str().unwrap().to_string();
+        t.handle(Key::Enter);
+        assert!(t.counterpart.as_ref().unwrap().choosing);
+        t.handle(Key::Esc);
+        assert_eq!(fs::read_to_string(&source).unwrap(), before);
+        // Non-transaction notes cannot produce a counterpart.
+        t.account.as_mut().unwrap().1.rows[0].debit = 0;
+        t.account.as_mut().unwrap().1.rows[0].credit = 0;
+        t.sel = Some(0);
+        for key in ['t', 'r'] {
+            t.handle(Key::Char(key));
+            assert!(t.counterpart.is_none());
+            assert!(t.msg.contains("entry with an amount"));
+        }
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

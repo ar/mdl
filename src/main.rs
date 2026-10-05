@@ -2,8 +2,8 @@
 //!
 //! The ledger is the first 5-column GFM table in the file:
 //! `| date | description | debit | credit | balance |`. Header labels are
-//! yours (`init` writes them in English, or Spanish with `--lang es`; nothing reads
-//! them back) and are preserved on rewrite. Empty amount cells
+//! yours (`init` writes them in English, or Spanish with `--lang es`) and are preserved
+//! on rewrite. Transfers use `Fecha` to choose Spanish description suffixes. Empty amount cells
 //! mean 0; a row with neither amount is a note (a dated remark) and leaves the
 //! balance as it was. Amounts are i64 cents; balance = Σ debit − Σ credit. Descriptions
 //! contain plain text. Amount inputs accept arithmetic as a calculation aid; only

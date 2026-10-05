@@ -91,9 +91,26 @@ first/last digit. Backspace/Delete clear a digit for replacement.
 Changing the date places the entry after existing rows on that day, recalculates
 balances, and keeps the moved entry selected. Short terminals use a compact entry row.
 
+On a selected statement row, `t` prepares a transfer counterpart: choose the
+**destination account** with the usual autocomplete, then review the amount. The
+new entry keeps the source date, swaps debit/credit, and appends `(from account)`
+to the description, or `(de account)` when the destination table has a Spanish
+`Fecha` header. The account name is the source filename without `.md`; the
+description remains editable. The amount
+is selected for replacement, so a different currency can use a converted amount or
+an expression such as `150*40.50`. Enter saves in the destination and returns to the
+source row; Esc cancels at either step. The source entry stays unchanged.
+
+`r` prepares a reversal in the same account, with the same date, swapped debit/credit,
+and the original description in parentheses. The description is focused first;
+all fields remain editable. Enter advances and saves a separate entry; Esc cancels.
+Both actions insert in date order and appear in session history. Rows without an
+amount cannot be transferred or reversed.
+
 Ctrl-H shows entries posted in the current TUI session as a table in the main screen,
 newest first, with Date, Account, Description, Debit, and Credit columns. Sessions
-opened with `mdl edit <file>` omit the Account column. Up/Down, PgUp/PgDn, or the
+opened with `mdl edit <file>` omit the Account column until transfers involve
+another account. Up/Down, PgUp/PgDn, or the
 mouse wheel scroll the history; Esc or Ctrl-H returns to your unchanged entry form.
 History is read-only and includes new entries and inserted rows, including notes.
 It disappears when the session ends.
