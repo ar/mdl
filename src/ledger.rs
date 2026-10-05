@@ -472,23 +472,29 @@ pub fn add_entry(rows: &mut Vec<Entry>, date: String, debit: i64, credit: i64, d
     Ok(i)
 }
 
-/// Replace row `i` (0-based). The date has to keep the order with its neighbours;
-/// moving is what `move` is for.
-pub fn edit_entry(rows: &mut [Entry], i: usize, date: String, debit: i64, credit: i64, desc: String) -> Result<(), String> {
+/// Destination of an edited row, excluding its old position. An unchanged date
+/// preserves manual ordering within a day; a changed date follows that day's rows.
+pub fn edited_position(rows: &[Entry], i: usize, date: &str) -> usize {
+    if rows[i].date == date {
+        i
+    } else {
+        rows.iter().enumerate().filter(|(j, _)| *j != i)
+            .take_while(|(_, e)| e.date.as_str() <= date).count()
+    }
+}
+
+/// Replace row `i` (0-based), repositioning it when the date changes.
+/// Preserves the flag, recomputes balances, and returns the new index.
+pub fn edit_entry(rows: &mut Vec<Entry>, i: usize, date: String, debit: i64, credit: i64, desc: String) -> Result<usize, String> {
     if i >= rows.len() {
         return Err(format!("row {}: no such row", i + 1));
     }
     check_entry(&date, debit, credit, &desc)?;
-    if i > 0 && date < rows[i - 1].date {
-        return Err(format!("date {date} is before row {} ({})", i, rows[i - 1].date));
-    }
-    if i + 1 < rows.len() && date > rows[i + 1].date {
-        return Err(format!("date {date} is after row {} ({})", i + 2, rows[i + 1].date));
-    }
-    let bold = rows[i].bold;
-    rows[i] = Entry { date, desc, debit, credit, balance: 0, bold };
+    let j = edited_position(rows, i, &date);
+    let bold = rows.remove(i).bold;
+    rows.insert(j, Entry { date, desc, debit, credit, balance: 0, bold });
     recalc(rows);
-    Ok(())
+    Ok(j)
 }
 
 /// Insert a new row right below row `i` (0-based). Its date has to keep the order with
@@ -716,15 +722,36 @@ pub mod tests {
         assert_eq!(row_index("2", 3).unwrap(), 1);
         assert_eq!(row_index("0", 3).unwrap_err(), "row 0: no such row (1..=3)");
         assert_eq!(row_index("x", 3).unwrap_err(), "bad row `x`");
-        // the date must stay between the neighbours
-        assert_eq!(edit_entry(&mut rows, 1, "2026-08-31".into(), 0, 30, "b".into()).unwrap_err(), "date 2026-08-31 is before row 1 (2026-09-01)");
-        assert_eq!(edit_entry(&mut rows, 1, "2026-09-06".into(), 0, 30, "b".into()).unwrap_err(), "date 2026-09-06 is after row 3 (2026-09-05)");
         assert!(edit_entry(&mut rows, 1, "2026-09-04".into(), 0, 50, "b2".into()).is_ok());
         assert_eq!((rows[1].date.as_str(), rows[1].credit, rows[2].balance), ("2026-09-04", 50, 60));
         assert_eq!(edit_entry(&mut rows, 5, "2026-09-04".into(), 0, 50, "b2".into()).unwrap_err(), "row 6: no such row");
         let e = delete_entry(&mut rows, 0).unwrap();
         assert_eq!((e.desc.as_str(), rows.len(), rows[0].balance, rows[1].balance), ("a", 2, -50, -40));
         assert!(delete_entry(&mut rows, 2).is_err());
+    }
+
+    #[test]
+    fn editing_dates_repositions_and_preserves_flags() {
+        let mut rows = sample();
+        rows[1].bold = true;
+        assert_eq!(edit_entry(&mut rows, 1, "2026-08-31".into(), 0, 30, "b".into()).unwrap(), 0);
+        assert_eq!(rows.iter().map(|e| e.balance).collect::<Vec<_>>(), [-30, 70, 80]);
+        assert!(rows[0].bold);
+        assert_eq!(edit_entry(&mut rows, 0, "2026-09-06".into(), 0, 30, "b".into()).unwrap(), 2);
+        assert_eq!(rows.iter().map(|e| e.balance).collect::<Vec<_>>(), [100, 110, 80]);
+        assert!(rows[2].bold);
+        // A changed date follows existing entries on that day.
+        assert_eq!(edit_entry(&mut rows, 2, "2026-09-01".into(), 0, 30, "b".into()).unwrap(), 1);
+        // An unchanged date retains the ordering within the day.
+        assert_eq!(edit_entry(&mut rows, 0, "2026-09-01".into(), 120, 0, "a".into()).unwrap(), 0);
+        assert_eq!(rows.iter().map(|e| e.balance).collect::<Vec<_>>(), [120, 90, 100]);
+        let before = rows.clone();
+        assert!(edit_entry(&mut rows, 1, "invalid".into(), 0, 30, "b".into()).is_err());
+        assert_eq!(rows.len(), before.len());
+        for (a, b) in rows.iter().zip(&before) {
+            assert_eq!((&a.date, &a.desc, a.debit, a.credit, a.balance, a.bold),
+                (&b.date, &b.desc, b.debit, b.credit, b.balance, b.bold));
+        }
     }
 
     #[test]

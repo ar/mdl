@@ -85,7 +85,11 @@ directly from the command line.
 The entry panel labels
 the fields and shows whether you are adding, editing, or inserting a row. The active
 field has a highlighted value and a cyan label; Enter advances or saves, and Tab
-moves between fields. Short terminals use a compact entry row.
+moves between fields. When editing a row, Shift-Tab from Description reaches Date. Date digits are
+overwritten in place; Left/Right skip the fixed separators, and Home/End reach the
+first/last digit. Backspace/Delete clear a digit for replacement.
+Changing the date places the entry after existing rows on that day, recalculates
+balances, and keeps the moved entry selected. Short terminals use a compact entry row.
 
 Ctrl-H shows entries posted in the current TUI session as a table in the main screen,
 newest first, with Date, Account, Description, Debit, and Credit columns. Sessions

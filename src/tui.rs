@@ -6,7 +6,7 @@ use std::time::{Duration, Instant};
 use std::{fs, process};
 
 use crate::git;
-use crate::ledger::{Doc, Entry, add_entry, delete_entry, amount_arg, edit_entry, entry_what, fmt_amount, fmt_col, insert_entry, load, move_entry, parse_amount, push_pending, recalc, recalc_diff, today};
+use crate::ledger::{Doc, Entry, add_entry, delete_entry, amount_arg, edit_entry, edited_position, entry_what, fmt_amount, fmt_col, insert_entry, load, move_entry, parse_amount, push_pending, recalc, recalc_diff, today};
 use crate::render::{grid, natural_widths, render_lines, totals};
 
 fn stty(args: &[&str]) -> Option<String> {
@@ -748,8 +748,12 @@ impl Tui {
         out += "\r\n\x1b[2K\x1b[2m│ \x1b[0m";
         let view = |i: usize| {
             let (f, w) = (&self.fields[i], self.w[i]);
-            let cur = if i == self.focus { self.cur() } else { usize::MAX };
-            if i >= 2 { amount_view(f, w, i == self.focus, cur) } else { field_view(f, w, cur) }
+            let cur = if i == self.focus { self.cur() }
+                else if i == 0 && self.editing.is_some() { 0 }
+                else { usize::MAX };
+            if i == 0 && self.editing.is_some() {
+                (f.chars().take(w).collect(), cur.min(9))
+            } else if i >= 2 { amount_view(f, w, i == self.focus, cur) } else { field_view(f, w, cur) }
         };
         for i in 0..5 {
             // Keep the terminal's background under the cursor: reverse video can
@@ -939,7 +943,7 @@ impl Tui {
             return;
         }
         self.focus = f;
-        self.cur = usize::MAX;
+        self.cur = if f == 0 && self.editing.is_some() { 0 } else { usize::MAX };
         self.select = f >= 2 && !self.fields[f].is_empty();
     }
 
@@ -1069,8 +1073,20 @@ impl Tui {
         self.cur.min(self.fields[self.focus].chars().count())
     }
 
-    /// A key in a text field: inserted at the cursor.
+    fn date_field(&self) -> bool {
+        self.editing.is_some() && self.focus == 0
+    }
+
+    /// Date digits overwrite fixed slots; other text is inserted at the cursor.
     fn insert_char(&mut self, c: char) {
+        if self.date_field() {
+            if c.is_ascii_digit() {
+                let at = self.cur().min(9);
+                self.fields[0].replace_range(at..at + 1, &c.to_string());
+                self.cur = match at { 3 | 6 => at + 2, _ => (at + 1).min(9) };
+            }
+            return;
+        }
         let cur = self.cur();
         let f = &mut self.fields[self.focus];
         f.insert(byte_at(f, cur), c);
@@ -1079,6 +1095,14 @@ impl Tui {
 
     /// Remove the char before (Backspace) or under (Delete) the cursor.
     fn erase(&mut self, before: bool) {
+        if self.date_field() {
+            let cur = self.cur().min(9);
+            if before && cur == 0 { return; }
+            let at = if before { match cur { 5 | 8 => cur - 2, _ => cur - 1 } } else { cur };
+            self.fields[0].replace_range(at..at + 1, " ");
+            self.cur = at;
+            return;
+        }
         let cur = self.cur();
         let f = &mut self.fields[self.focus];
         let at = if before { cur.checked_sub(1) } else { Some(cur).filter(|&c| c < f.chars().count()) };
@@ -1303,35 +1327,41 @@ impl Tui {
     fn submit_edit(&mut self) {
         let Some(i) = self.editing else { return };
         let insert = self.insert;
-        let before = if insert { Some(i) } else { i.checked_sub(1) };
-        let amounts = self.amounts(before.map_or(0, |j| self.rows()[j].balance));
+        let date = self.fields[0].trim().to_string();
+        let balance = if insert {
+            self.rows()[i].balance
+        } else {
+            let j = edited_position(self.rows(), i, &date);
+            self.rows().iter().enumerate().filter(|(k, _)| *k != i)
+                .take(j).map(|(_, e)| e.debit - e.credit).sum()
+        };
+        let amounts = self.amounts(balance);
         let Some((_, doc)) = self.account.as_mut() else { return };
         let desc = self.fields[1].trim().to_string();
-        let date = self.fields[0].trim().to_string();
         let r = amounts.and_then(|(d, c)| {
                 if insert {
-                    insert_entry(&mut doc.rows, i, date, d, c, desc.clone()).map(|_| (d, c))
+                    insert_entry(&mut doc.rows, i, date, d, c, desc.clone()).map(|_| (i + 1, d, c))
                 } else {
-                    edit_entry(&mut doc.rows, i, date, d, c, desc.clone()).map(|_| (d, c))
+                    edit_entry(&mut doc.rows, i, date, d, c, desc.clone()).map(|j| (j, d, c))
                 }
             });
-        let r = r.and_then(|(d, c)| {
+        let r = r.and_then(|(j, d, c)| {
             let what = if insert {
                 format!("{} after row {}", entry_what(d, c, &desc), i + 1)
             } else {
                 format!("edit row {}: {desc}", i + 1)
             };
-            self.save(&what)
+            self.save(&what).map(|note| (j, note))
         });
         match r {
-            Ok(note) => {
-                let (j, verb) = if insert { (i + 1, "added") } else { (i, "updated") };
+            Ok((j, note)) => {
+                let verb = if insert { "added" } else { "updated" };
                 if insert {
                     self.record_post(j);
                 }
                 self.msg = if note.is_empty() { format!("row {} {verb}", j + 1) } else { format!("row {} {verb}; {note}", j + 1) };
                 self.cancel_edit();
-                if insert {
+                if insert || self.sel.is_some() {
                     self.sel = Some(j);
                 }
                 self.rebuild();
@@ -1697,12 +1727,20 @@ impl Tui {
             Key::Left | Key::Right | Key::Home | Key::End => {
                 if self.sel.is_none() || self.editing.is_some() {
                     let n = self.fields[self.focus].chars().count();
-                    self.cur = match key {
+                    self.cur = if self.date_field() {
+                        let cur = self.cur().min(9);
+                        match key {
+                            Key::Left => match cur { 5 | 8 => cur - 2, _ => cur.saturating_sub(1) },
+                            Key::Right => match cur { 3 | 6 => cur + 2, _ => (cur + 1).min(9) },
+                            Key::Home => 0,
+                            _ => 9,
+                        }
+                    } else { match key {
                         Key::Left => self.cur().saturating_sub(1),
                         Key::Right => (self.cur() + 1).min(n),
                         Key::Home => 0,
                         _ => usize::MAX,
-                    };
+                    }};
                 }
             }
             Key::MoveUp | Key::MoveDown => {
@@ -1836,6 +1874,37 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn date_digits_stay_in_fixed_positions() {
+        let mut t = Tui::new();
+        t.editing = Some(0);
+        t.fields[0] = "2026-10-05".into();
+        t.set_focus(0);
+        for expected in [1, 2, 3, 5, 6, 8, 9, 9] {
+            t.handle(Key::Right);
+            assert_eq!(t.cur(), expected);
+            let frame = without_ansi(&t.draw());
+            let field = frame.split("\r\n").nth(t.field_row() - 1).unwrap();
+            assert!(field.starts_with("│ 2026-10-05"));
+        }
+        t.handle(Key::Home);
+        for c in "2027-12-31".chars() { t.handle(Key::Char(c)); }
+        assert_eq!(t.fields[0], "2027-12-31");
+        t.handle(Key::Left);
+        t.handle(Key::Left);
+        assert_eq!(t.cur(), 6);
+        t.handle(Key::Delete);
+        assert_eq!(t.fields[0], "2027-1 -31");
+        t.handle(Key::Char('0'));
+        t.handle(Key::Backspace);
+        assert_eq!((t.fields[0].as_str(), t.cur()), ("2027-1 -31", 6));
+        t.handle(Key::Char('1'));
+        t.handle(Key::Char('x'));
+        assert_eq!(t.fields[0], "2027-11-31");
+        t.handle(Key::End);
+        assert_eq!(t.cur(), 9);
     }
 
     #[test]
@@ -2211,24 +2280,61 @@ mod tests {
         assert_eq!(t.rows()[4].balance, 27800);
         assert!(fs::read_to_string(&file).unwrap().contains("|  278.00 |"));
 
-        // a date out of order is refused and stays in edit
+        // Changing the date moves the entry and keeps it selected.
         t.handle(Key::Enter);
         t.fields[0] = "2026-09-20".into();
         t.focus = 3;
         t.handle(Key::Enter);
-        assert_eq!(t.editing, Some(2));
-        assert_eq!(t.msg, "date 2026-09-20 is after row 4 (2026-09-04)");
-        t.handle(Key::Esc);
+        assert_eq!((t.editing, t.sel), (None, Some(4)));
+        assert_eq!(t.msg, "row 5 updated");
+        let saved = load(file.to_str().unwrap()).unwrap();
+        assert_eq!((saved.rows[4].date.as_str(), saved.rows[4].desc.as_str(), saved.rows[4].balance),
+            ("2026-09-20", "Coffee", 27800));
 
-        // delete at once; the selection stays on the same row number
+        // Delete the moved entry; selection clamps to the remaining last row
         t.handle(Key::Delete);
-        assert_eq!(t.msg, "row 3 deleted");
-        assert_eq!((t.rows().len(), t.sel), (4, Some(2)));
+        assert_eq!(t.msg, "row 5 deleted");
+        assert_eq!((t.rows().len(), t.sel), (4, Some(3)));
         assert!(!fs::read_to_string(&file).unwrap().contains("Coffee"));
         // typing leaves statement mode and goes to the focused field
         t.handle(Key::Char('x'));
         assert_eq!((t.sel, t.fields[0].as_str()), (None, format!("{stem}x").as_str()));
         let _ = fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn date_edit_uses_balance_at_destination() {
+        let dir = std::env::temp_dir().join(format!("mdl-tui-date-balance-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("cash.md");
+        fs::write(&file, cash_head(5)).unwrap();
+        let path = file.to_str().unwrap().to_string();
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.account = Some((path.clone(), load(&path).unwrap()));
+        t.sel = Some(2);
+        t.handle(Key::Enter);
+        t.handle(Key::Prev);
+        assert_eq!(t.focus, 0);
+        t.fields[0] = "2026-08-31".into();
+        t.fields[3].clear();
+        t.fields[4] = "100".into();
+        t.focus = 4;
+        t.handle(Key::Enter);
+        assert_eq!((t.editing, t.sel), (None, Some(0)));
+        assert_eq!((t.rows()[0].debit, t.rows()[0].credit, t.rows()[0].balance), (10000, 0, 10000));
+        assert_eq!(load(&path).unwrap().rows[0].desc, "Coffee");
+        // Moving forward must exclude the entry's old amount from the target balance.
+        t.handle(Key::Enter);
+        t.fields[0] = "2026-09-20".into();
+        t.fields[2].clear();
+        t.fields[4] = "100".into();
+        t.focus = 4;
+        t.handle(Key::Enter);
+        assert_eq!((t.editing, t.sel), (None, Some(4)));
+        assert_eq!(t.rows()[4].balance, 10000);
+        assert_eq!(load(&path).unwrap().rows[4].balance, 10000);
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
