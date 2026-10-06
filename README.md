@@ -139,6 +139,57 @@ by ` / `. Quiet output lists every displayed group and account amount in order,
 then the total; `--total -q` prints only the total. Group rows are subtotals and
 must not be added again when processing exports.
 
+### Graphing a chart over time
+
+`mdl graph` plots the total, every group subtotal, and every child account in
+`chart.md`. Use `--chart` to select a different report. The graph follows the
+inline presentation used by `hackdiet`: a line plot with a prominent total,
+summary values, a muted background, and a legend with each series’ latest value.
+Group lines are dashed; the overall total is thicker and red. Series names use
+the full hierarchy path so accounts with matching labels remain distinguishable.
+
+```sh
+mdl graph this                              # daily closes this month
+mdl graph last 3                            # daily closes over three months
+mdl graph --from 2026-01                    # from January through recorded history
+mdl graph --to 2026-10-06                   # history through this exact date
+mdl graph --from 2026-01 --to 2026-09        # inclusive month bounds
+mdl graph --help                            # graph options
+mdl graph --monthly this 12                  # one month-end snapshot per month
+mdl graph --chart chart-usd.md --monthly 2026-01 2026-09
+mdl graph --monthly this 12 --total          # only the overall total
+mdl graph --monthly this 12 -o balances.png  # export the same graph
+```
+
+The period syntax is the same as statements. Without a period, the graph spans
+the months containing the earliest and latest entries in the chart’s accounts.
+Use `--from` and `--to` for independent inclusive bounds, each accepting `YYYY-MM`
+or `YYYY-MM-DD`. A start month begins on its first day; an end month ends on its
+last day. An omitted bound uses the first or last recorded month, respectively.
+Do not combine these flags with a positional period such as `this 12`. Reversed
+bounds are rejected, including when an inferred bound falls outside the explicit
+bound. An empty chart hierarchy needs a positional period or both bounds.
+
+The default samples the last balance on each calendar day; `--monthly` samples the last balance on or before
+each month-end. When `--to` specifies an exact date before month-end, monthly mode
+includes a final snapshot on that date. Both carry balances forward across gaps
+and use zero before an account’s first entry. Month-based selections include the
+full months, including any future-dated entries; exact date bounds stop on the
+specified days. Lines connect those snapshots; they are not transaction
+volume or interpolated daily accounting data. The summary change compares the
+first and last plotted snapshots.
+
+Group values sum their descendants, while the overall total counts each account
+once. As with balance reports, values come from the stored balance column.
+Invalid or unordered dates are rejected. Separate currency charts remain separate;
+no currency conversion is performed.
+
+Ghostty and Kitty display the graph inline. Other terminals, tmux/screen, and
+redirected output receive a table of the same snapshots. `-o` saves a PNG even
+without inline graphics. PNG and inline rendering require Typst; the table fallback
+does not. The existing `mdl <account> graph` command still graphs that account’s
+transaction history.
+
 ## Interactive entry
 
 Run `mdl` without arguments to open the interactive ledger, or `mdl edit cash` to

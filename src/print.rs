@@ -7,7 +7,7 @@ use crate::ledger::{Doc, Entry, fmt_amount, month_add, period_label};
 use crate::render::{grid, totals};
 
 /// A Typst string literal.
-fn typst_str(s: &str) -> String {
+pub(crate) fn typst_str(s: &str) -> String {
     format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\"").replace('\n', "\\n"))
 }
 
@@ -97,7 +97,7 @@ fn render_typst_accounts(doc: &Doc, file: &str, p: &Option<(String, String)>, se
 }
 
 /// Days since 1970-01-01 of a `YYYY-MM-DD` date (the inverse of `today`'s arithmetic).
-fn day_number(date: &str) -> i64 {
+pub(crate) fn day_number(date: &str) -> i64 {
     let n = |r: std::ops::Range<usize>| date.get(r).and_then(|s| s.parse::<i64>().ok()).unwrap_or(1);
     let (y, m, d) = (n(0..4), n(5..7), n(8..10));
     let y = if m <= 2 { y - 1 } else { y };
@@ -309,6 +309,10 @@ pub fn graph_png_accounts(doc: &Doc, p: &Option<(String, String)>, series: &[Str
     let source = format!(
         "#set page(width: 18cm, height: 9cm, margin: (x: 0.4cm, y: 0.3cm), fill: white)\n#set text(font: (\"Helvetica Neue\", \"Libertinus Serif\"), 10pt)\n{chart}"
     );
+    png_from_typst(&source).map(Some)
+}
+
+pub(crate) fn png_from_typst(source: &str) -> Result<Vec<u8>, String> {
     let mut child = process::Command::new("typst")
         .args(["compile", "--format", "png", "-", "-"])
         .stdin(process::Stdio::piped())
@@ -320,7 +324,7 @@ pub fn graph_png_accounts(doc: &Doc, p: &Option<(String, String)>, series: &[Str
     if !out.status.success() {
         return Err("typst failed to render graph".into());
     }
-    Ok(Some(out.stdout))
+    Ok(out.stdout)
 }
 
 #[cfg(test)]

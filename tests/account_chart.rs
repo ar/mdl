@@ -309,3 +309,274 @@ fn fenced_lists_remain_report_text() {
     assert!(f.output(&["balance", "--markdown"]).starts_with(preamble));
     assert_eq!(f.output(&["balance", "--total", "-q"]), "200.00\n");
 }
+
+#[test]
+fn monthly_graph_matches_snapshots_and_carries_balances_forward() {
+    let f = Fixture::new();
+    let text = f.output(&[
+        "graph",
+        "--chart",
+        "charts/usd.md",
+        "--monthly",
+        "2024-01",
+        "2024-04",
+    ]);
+    assert!(text.contains("monthly balances"));
+    assert!(text.contains("Assets / Bank / Checking"));
+    let rows: Vec<Vec<_>> = text
+        .lines()
+        .filter(|line| line.starts_with("2024-"))
+        .map(|line| line.split_whitespace().collect())
+        .collect();
+    assert_eq!(rows.len(), 4);
+    assert_eq!(
+        rows[0],
+        [
+            "2024-01-31",
+            "0.00",
+            "0.00",
+            "0.00",
+            "0.00",
+            "0.00",
+            "0.00",
+            "0.00"
+        ]
+    );
+    assert_eq!(
+        rows[1],
+        [
+            "2024-02-29",
+            "90.00",
+            "120.00",
+            "120.00",
+            "120.00",
+            "0.00",
+            "-30.00",
+            "-30.00"
+        ]
+    );
+    assert_eq!(
+        rows[2],
+        [
+            "2024-03-31",
+            "170.00",
+            "200.00",
+            "200.00",
+            "200.00",
+            "0.00",
+            "-30.00",
+            "-30.00"
+        ]
+    );
+    assert_eq!(&rows[2][1..], &rows[3][1..]);
+    for row in rows {
+        assert_eq!(
+            row[1],
+            f.output(&[
+                "balance",
+                "--chart",
+                "charts/usd.md",
+                "--as-of",
+                row[0],
+                "--total",
+                "-q"
+            ])
+            .trim()
+        );
+    }
+    assert!(!text.contains('\x1b'));
+    let total = f.output(&["graph", "--monthly", "--total"]);
+    assert!(!total.contains("Cash"));
+    assert!(total.contains("2024-02-29  120.00"));
+    assert!(total.contains("2024-03-31  200.00"));
+}
+
+#[test]
+fn daily_graph_closes_each_day_and_handles_empty_periods() {
+    let f = Fixture::new();
+    let text = f.output(&["graph", "--total", "2024-02"]);
+    let rows: Vec<_> = text
+        .lines()
+        .filter(|line| line.starts_with("2024-"))
+        .collect();
+    assert_eq!(rows.len(), 29);
+    assert!(rows[0].ends_with("0.00"));
+    assert!(rows[27].ends_with("100.00"));
+    assert!(rows[28].ends_with("120.00"));
+    fs::write(f.0.join("chart.md"), "- Empty group\n").unwrap();
+    f.reject(&["graph"], "graph needs a period");
+    let zero = f.output(&["graph", "--monthly", "2024-01"]);
+    assert_eq!(
+        zero.lines()
+            .find(|line| line.starts_with("2024-01-31"))
+            .unwrap()
+            .split_whitespace()
+            .collect::<Vec<_>>(),
+        ["2024-01-31", "0.00", "0.00"]
+    );
+    for args in [vec!["graph", "--chart"], vec!["graph", "-o"]] {
+        f.reject(&args, "needs a value");
+    }
+    f.reject(&["graph", "--as-of", "2024-01-01"], "unknown option");
+    f.reject(&["graph", "2024-03", "2024-01"], "bad period");
+}
+
+#[test]
+fn graph_checks_history_even_without_an_explicit_period() {
+    let f = Fixture::new();
+    let path = f.0.join("bank.md");
+    let text = fs::read_to_string(&path).unwrap();
+    fs::write(&path, text.replace("2024-03-01", "2024-02-01")).unwrap();
+    f.reject(&["graph", "--monthly"], "dates are not in order");
+    fs::write(path, text.replace("2024-03-01", "2024-02-30")).unwrap();
+    f.reject(&["graph"], "invalid date");
+}
+
+#[test]
+fn graph_exports_real_pngs_for_monthly_daily_and_zero_series() {
+    if Command::new("typst").arg("--version").output().is_err() {
+        return;
+    }
+    let f = Fixture::new();
+    for args in [
+        vec![
+            "graph",
+            "--chart",
+            "charts/usd.md",
+            "--monthly",
+            "2024-01",
+            "2024-04",
+            "-o",
+            "monthly.png",
+        ],
+        vec!["graph", "2024-02", "-o", "daily.png"],
+        vec![
+            "graph",
+            "--monthly",
+            "--from",
+            "2024-02-28",
+            "--to",
+            "2024-03-01",
+            "-o",
+            "bounded.png",
+        ],
+        vec!["graph", "--total", "--monthly", "2024-01", "-o", "zero.png"],
+    ] {
+        f.output(&args);
+        let bytes = fs::read(f.0.join(args.last().unwrap())).unwrap();
+        assert!(bytes.starts_with(b"\x89PNG\r\n\x1a\n"));
+    }
+}
+
+#[test]
+fn graph_help_is_available_without_a_chart() {
+    let f = Fixture::new();
+    fs::remove_file(f.0.join("chart.md")).unwrap();
+    for args in [vec!["--help"], vec!["graph", "--help"], vec!["graph", "-h"]] {
+        let text = f.output(&args);
+        assert!(text.contains("mdl graph"));
+        assert!(text.contains("--from YYYY-MM[-DD]"));
+        assert!(text.contains("--to YYYY-MM[-DD]"));
+    }
+}
+
+#[test]
+fn graph_optional_bounds_and_partial_month_closes() {
+    let f = Fixture::new();
+    let dates = |args: &[&str]| -> Vec<Vec<String>> {
+        f.output(args)
+            .lines()
+            .filter(|line| line.starts_with("2024-"))
+            .map(|line| line.split_whitespace().map(String::from).collect())
+            .collect()
+    };
+    assert_eq!(
+        dates(&["graph", "--monthly", "--total", "--from", "2024-03"]),
+        vec![vec!["2024-03-31", "200.00"]]
+    );
+    assert_eq!(
+        dates(&["graph", "--monthly", "--total", "--to", "2024-02"]),
+        vec![vec!["2024-02-29", "120.00"]]
+    );
+    assert_eq!(
+        dates(&[
+            "graph",
+            "--total",
+            "--from",
+            "2024-02-28",
+            "--to",
+            "2024-03-01"
+        ]),
+        vec![
+            vec!["2024-02-28", "100.00"],
+            vec!["2024-02-29", "120.00"],
+            vec!["2024-03-01", "200.00"]
+        ]
+    );
+    assert_eq!(
+        dates(&[
+            "graph",
+            "--monthly",
+            "--total",
+            "--from",
+            "2024-01",
+            "--to",
+            "2024-02-28"
+        ]),
+        vec![vec!["2024-01-31", "0.00"], vec!["2024-02-28", "100.00"]]
+    );
+    let before = dates(&["graph", "--total", "--to", "2024-02-28"]);
+    assert_eq!(before.first().unwrap(), &["2024-02-01", "0.00"]);
+    assert_eq!(before.last().unwrap(), &["2024-02-28", "100.00"]);
+    let after = dates(&["graph", "--total", "--from", "2024-02-29"]);
+    assert_eq!(after.first().unwrap(), &["2024-02-29", "120.00"]);
+    assert_eq!(after.last().unwrap(), &["2024-03-31", "200.00"]);
+    assert_eq!(
+        dates(&[
+            "graph",
+            "--total",
+            "--monthly",
+            "--from",
+            "2024-02-28",
+            "--to",
+            "2024-02-28"
+        ]),
+        vec![vec!["2024-02-28", "100.00"]]
+    );
+    fs::write(f.0.join("chart.md"), "- Empty\n").unwrap();
+    assert_eq!(
+        dates(&[
+            "graph",
+            "--total",
+            "--from",
+            "2024-02-29",
+            "--to",
+            "2024-02-29"
+        ]),
+        vec![vec!["2024-02-29", "0.00"]]
+    );
+    f.reject(&["graph", "--from", "2024-01"], "both --from and --to");
+}
+
+#[test]
+fn graph_rejects_invalid_or_ambiguous_bounds() {
+    let f = Fixture::new();
+    for option in ["--from", "--to"] {
+        f.reject(&["graph", option], "needs a value");
+        f.reject(&["graph", option, "2023-02-29"], "invalid date");
+        f.reject(&["graph", option, "2024-13"], "invalid date");
+        f.reject(&["graph", option, "2024-02", option, "2024-03"], "repeated");
+        f.reject(
+            &["graph", "this", "12", option, "2024-02"],
+            "either a period or",
+        );
+    }
+    f.reject(
+        &["graph", "--from", "2024-03", "--to", "2024-02"],
+        "start date must not follow end date",
+    );
+    f.reject(
+        &["graph", "--from", "2024-04"],
+        "start date must not follow end date",
+    );
+}

@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use crate::ledger::{balance, fmt_amount, load, resolve};
+use crate::ledger::{balance, fmt_amount, load, month_add, resolve, Entry};
 use crate::render::{csv_str, json_str};
 
 pub struct Node {
@@ -11,6 +11,7 @@ pub struct Node {
     file: Option<String>,
     children: Vec<Node>,
     amount: i64,
+    history: Vec<Entry>,
 }
 
 pub struct Chart {
@@ -59,23 +60,31 @@ pub fn validate_date(date: &str) -> Result<(), String> {
 /// Same closing balance as the existing command; snapshots require valid, ordered dates.
 pub fn account_balance(file: &str, as_of: Option<&str>) -> Result<i64, String> {
     let doc = load(file)?;
-    if let Some(date) = as_of {
-        let mut previous = "";
-        for row in &doc.rows {
-            validate_date(&row.date).map_err(|e| format!("{file}: {e}"))?;
-            if row.date.as_str() < previous {
-                return Err(format!("{file}: dates are not in order"));
-            }
-            previous = &row.date;
+    snapshot(&doc.rows, file, as_of)
+}
+
+fn validate_history(rows: &[Entry], file: &str) -> Result<(), String> {
+    let mut previous = "";
+    for row in rows {
+        validate_date(&row.date).map_err(|e| format!("{file}: {e}"))?;
+        if row.date.as_str() < previous {
+            return Err(format!("{file}: dates are not in order"));
         }
-        Ok(doc
-            .rows
+        previous = &row.date;
+    }
+    Ok(())
+}
+
+fn snapshot(rows: &[Entry], file: &str, as_of: Option<&str>) -> Result<i64, String> {
+    if let Some(date) = as_of {
+        validate_history(rows, file)?;
+        Ok(rows
             .iter()
             .rev()
             .find(|e| e.date.as_str() <= date)
             .map_or(0, |e| e.balance))
     } else {
-        Ok(balance(&doc.rows))
+        Ok(balance(rows))
     }
 }
 
@@ -116,13 +125,15 @@ fn nodes(
         } else {
             Vec::new()
         };
+        let mut history = Vec::new();
         let amount = if let Some(file) = &item.file {
             let path = resolve(&base.join(file).to_string_lossy());
             let canonical = fs::canonicalize(&path).map_err(|e| format!("{path}: {e}"))?;
             if !seen.insert(canonical) {
                 return Err(format!("line {}: duplicate account `{file}`", item.line));
             }
-            account_balance(&path, as_of)?
+            history = load(&path)?.rows;
+            snapshot(&history, &path, as_of)?
         } else {
             sum(children.iter().map(|n| n.amount))?
         };
@@ -131,6 +142,7 @@ fn nodes(
             file: item.file.clone(),
             children,
             amount,
+            history,
         });
     }
     Ok(result)
@@ -395,4 +407,188 @@ fn document_text(text: &str, format: &str, styled: bool) -> String {
         })
         .collect::<Vec<_>>()
         .join("\n")
+}
+
+/// A sampled balance history. All series share the same snapshot dates.
+pub struct Evolution {
+    pub title: String,
+    pub dates: Vec<String>,
+    pub series: Vec<BalanceSeries>,
+    pub monthly: bool,
+}
+
+pub struct BalanceSeries {
+    pub name: String,
+    pub values: Vec<i64>,
+    pub group: bool,
+}
+
+fn month_end(month: &str) -> String {
+    (28..=31)
+        .rev()
+        .map(|day| format!("{month}-{day:02}"))
+        .find(|date| validate_date(date).is_ok())
+        .unwrap()
+}
+
+pub fn evolution(
+    chart: &Chart,
+    period: &Option<(String, String)>,
+    bounds: (Option<&str>, Option<&str>),
+    monthly: bool,
+    only_total: bool,
+) -> Result<Evolution, String> {
+    let mut flat = Vec::new();
+    flatten(&chart.nodes, 0, &[], &mut flat);
+    for (node, _, path) in &flat {
+        validate_history(&node.history, &path.join(" / "))?;
+    }
+    let recorded: Vec<_> = flat
+        .iter()
+        .flat_map(|(node, _, _)| node.history.iter().map(|row| row.date.as_str()))
+        .collect();
+    fn bound(value: &str, end: bool) -> Result<String, String> {
+        if value.len() == 7 {
+            validate_date(&format!("{value}-01"))?;
+            Ok(if end {
+                month_end(value)
+            } else {
+                format!("{value}-01")
+            })
+        } else {
+            validate_date(value)?;
+            Ok(value.to_string())
+        }
+    }
+    let missing = "graph needs a period or both --from and --to when the chart has no entries";
+    let from = match bounds.0.or_else(|| period.as_ref().map(|p| p.0.as_str())) {
+        Some(value) => bound(value, false)?,
+        None => format!("{}-01", &recorded.iter().min().ok_or(missing)?[..7]),
+    };
+    let to = match bounds.1.or_else(|| period.as_ref().map(|p| p.1.as_str())) {
+        Some(value) => bound(value, true)?,
+        None => month_end(&recorded.iter().max().ok_or(missing)?[..7]),
+    };
+    if from > to {
+        return Err("graph: start date must not follow end date".into());
+    }
+    let mut dates = Vec::new();
+    let mut month = from[..7].to_string();
+    loop {
+        let end = month_end(&month).min(to.clone());
+        if monthly {
+            dates.push(end);
+        } else {
+            let days: u32 = end[8..].parse().unwrap();
+            let first = if month == from[..7] {
+                from[8..].parse().unwrap()
+            } else {
+                1
+            };
+            dates.extend((first..=days).map(|day| format!("{month}-{day:02}")));
+        }
+        if dates.len() > 120_000 {
+            return Err("graph period is too large; use --monthly or a shorter period".into());
+        }
+        if month == to[..7] {
+            break;
+        }
+        month = month_add(&month, 1);
+    }
+    fn sample(
+        node: &Node,
+        dates: &[String],
+        path: &str,
+        series: &mut Vec<BalanceSeries>,
+    ) -> Result<Vec<i64>, String> {
+        let index = series.len();
+        series.push(BalanceSeries {
+            name: path.to_string(),
+            values: vec![],
+            group: node.file.is_none(),
+        });
+        let mut values = vec![0i64; dates.len()];
+        if node.file.is_some() {
+            let mut row = 0;
+            let mut value = 0;
+            for (i, date) in dates.iter().enumerate() {
+                while row < node.history.len() && node.history[row].date <= *date {
+                    value = node.history[row].balance;
+                    row += 1;
+                }
+                values[i] = value;
+            }
+        } else {
+            for child in &node.children {
+                let child_values =
+                    sample(child, dates, &format!("{path} / {}", child.name), series)?;
+                for (value, child) in values.iter_mut().zip(child_values) {
+                    *value = value
+                        .checked_add(child)
+                        .ok_or("chart balance out of range")?;
+                }
+            }
+        }
+        series[index].values = values.clone();
+        Ok(values)
+    }
+    let mut series = vec![BalanceSeries {
+        name: "Total".into(),
+        values: vec![0; dates.len()],
+        group: true,
+    }];
+    for node in &chart.nodes {
+        let values = sample(node, &dates, &node.name, &mut series)?;
+        for (total, value) in series[0].values.iter_mut().zip(values) {
+            *total = total
+                .checked_add(value)
+                .ok_or("chart balance out of range")?;
+        }
+    }
+    if only_total {
+        series.truncate(1);
+    }
+    Ok(Evolution {
+        title: chart.title.clone().unwrap_or_else(|| "Balances".into()),
+        dates,
+        series,
+        monthly,
+    })
+}
+
+pub fn render_evolution(data: &Evolution) -> String {
+    let mut out = format!(
+        "{} — {} balances\n\n",
+        data.title,
+        if data.monthly {
+            "monthly"
+        } else {
+            "daily closing"
+        }
+    );
+    let widths: Vec<_> = data
+        .series
+        .iter()
+        .map(|s| {
+            s.values
+                .iter()
+                .map(|v| fmt_amount(*v).len())
+                .chain([s.name.chars().count()])
+                .max()
+                .unwrap()
+        })
+        .collect();
+    out += "Date      ";
+    for (series, width) in data.series.iter().zip(&widths) {
+        out += &format!("  {:>width$}", series.name);
+    }
+    out += "\n";
+    for (i, date) in data.dates.iter().enumerate() {
+        out += date;
+        for (series, width) in data.series.iter().zip(&widths) {
+            out += &format!("  {:>width$}", fmt_amount(series.values[i]));
+        }
+        out += "\n";
+    }
+    out
 }

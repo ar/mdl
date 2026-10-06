@@ -18,6 +18,7 @@
 use ledger::balance;
 
 mod account_chart;
+mod evolution_plot;
 mod git;
 mod chart;
 mod ledger;
@@ -97,6 +98,24 @@ period      YYYY-MM [YYYY-MM] | this [N] | last [N]: months; this N ends with
 amount      1234.50, or a computation: 100+200+50, 1000*40.50
             in the interactive screen, calculate directly in Debit, Credit or
             Balance; Enter evaluates and advances/saves, Tab evaluates and moves
+";
+
+const GRAPH_USAGE: &str = "\
+Graphs
+  mdl graph [period] [options]         chart total, groups, and child accounts
+                                       defaults to chart.md and its full history
+  --chart <path>                       select a different account chart
+  --from YYYY-MM[-DD]                  inclusive start; default: first recorded month
+  --to YYYY-MM[-DD]                    inclusive end; default: last recorded month
+  --monthly                           month-end snapshots (daily closes by default)
+                                       an exact --to also includes that day's close
+  --total                             plot only the overall total
+  -o <png>                            save the graph as a PNG
+  mdl graph --help                     show this graph help
+
+  period: YYYY-MM [YYYY-MM] | this [N] | last [N]
+  Use either a period or --from/--to. Either bound may be omitted.
+  Inline graphics use Ghostty/Kitty; other terminals show a snapshot table.
 ";
 
 /// A command line that does not parse: one line saying what is missing, and where the
@@ -333,6 +352,58 @@ fn cmd_balance(initial_files: &[String], args: &[String]) -> Result<(), String> 
     Ok(())
 }
 
+/// Chart-level evolution, distinct from the existing per-ledger graph command.
+fn cmd_chart_graph(args: &[String]) -> Result<(), String> {
+    if args.iter().any(|arg| arg == "--help" || arg == "-h") {
+        print!("{GRAPH_USAGE}");
+        return Ok(());
+    }
+    let mut file = None;
+    let mut out = None;
+    let mut from = None;
+    let mut to = None;
+    let mut monthly = false;
+    let mut only_total = false;
+    let mut words = Vec::new();
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--chart" | "-o" | "--from" | "--to" => {
+                let value = args.next().filter(|v| !v.starts_with('-'))
+                    .ok_or_else(|| format!("graph: {arg} needs a value"))?;
+                let slot = match arg.as_str() {
+                    "--chart" => &mut file,
+                    "--from" => &mut from,
+                    "--to" => &mut to,
+                    _ => &mut out,
+                };
+                if slot.replace(value.as_str()).is_some() { return Err(format!("graph: repeated {arg}")); }
+            }
+            "--monthly" => monthly = true,
+            "--total" => only_total = true,
+            _ if arg.starts_with('-') => return Err(format!("graph: unknown option {arg}")),
+            _ => words.push(arg.clone()),
+        }
+    }
+    if !words.is_empty() && (from.is_some() || to.is_some()) {
+        return Err("graph: use either a period or --from/--to".into());
+    }
+    let period = period(&words, &today())?;
+    let chart = account_chart::load_chart(file.unwrap_or("chart.md"), None)?;
+    let data = account_chart::evolution(&chart, &period, (from, to), monthly, only_total)?;
+    if out.is_some() || chart::supported() {
+        let png = evolution_plot::png(&data)?;
+        if let Some(path) = out {
+            fs::write(path, &png).map_err(|e| format!("{path}: {e}"))?;
+            println!("wrote {path}");
+        }
+        if chart::supported() { chart::display(&png).map_err(|e| format!("graph: {e}"))?; }
+    } else {
+        print!("{}", account_chart::render_evolution(&data));
+    }
+    Ok(())
+}
+
 /// Keep each account's own running balance when charting a combined statement.
 fn chart_accounts(files: &[String], p: &Option<(String, String)>) -> Result<Vec<(String, ledger::Doc)>, String> {
     if files.len() < 2 {
@@ -350,7 +421,7 @@ fn run() -> Result<(), String> {
         return tui(None);
     }
     if args.first().is_some_and(|a| a == "--help" || a == "-h") {
-        print!("{USAGE}");
+        print!("{USAGE}\n{GRAPH_USAGE}");
         return Ok(());
     }
     if args.first().is_some_and(|a| a == "--version") {
@@ -359,6 +430,9 @@ fn run() -> Result<(), String> {
     }
     if args.first().is_some_and(|a| a == "balance") {
         return cmd_balance(&[], &args[1..]);
+    }
+    if args.first().is_some_and(|a| a == "graph") {
+        return cmd_chart_graph(&args[1..]);
     }
     match args.as_slice() {
         [c] if c == "fetch" => return cmd_fetch(),
