@@ -63,6 +63,82 @@ mdl cash show last 3 --markdown # the same period as a Markdown table
 Each period starts with its opening balance; debit and credit totals cover only
 entries within that period. Output flags may appear before or after the period.
 
+## Account charts and balance snapshots
+
+`mdl balance` uses `chart.md` in the current directory when no account files are
+specified. Use `--chart <path>` to select a different chart. A chart is a Markdown
+report with an account hierarchy; no title, currency, or other metadata is required:
+
+```markdown
+# Balances in USD
+
+Balances exclude retirement savings.
+
+- Assets
+  - Bank
+    - [Checking](accounts/checking-usd.md)
+    - [Savings](accounts/savings-usd.md)
+  - Investments
+    - [Brokerage](accounts/brokerage-usd.md)
+- Liabilities
+  - [Credit card](accounts/card-usd.md)
+```
+
+The first `- ` list outside a fenced code block is the account hierarchy, indented
+by exactly two spaces per level. Blank lines within the list are allowed; the
+first nonblank, non-list line ends the hierarchy. Plain items are groups;
+`[Label](path)` items are accounts and cannot have children. Paths are relative to
+the chart file, with the same optional `.md` extension as command-line accounts.
+
+Headings and prose before and after the hierarchy appear around the balance
+report. Markdown export preserves that surrounding Markdown; terminal output
+simplifies headings and keeps the remaining text. `Currency:` has no special
+meaning and, if present, appears as ordinary text. `--as-of` adds the snapshot
+date above the balance report.
+
+Each group sums its children; empty groups and zero accounts remain visible.
+Labels indent two spaces to the right per level. Amounts are right justified,
+with their right edge moving **two spaces left** per level; top-level groups and
+the final total have the rightmost amounts. Groups and the total are bold in a
+terminal. Account signs are preserved: group names such as Assets and Liabilities
+do not change arithmetic. The final total sums each account once.
+
+Only listed accounts participate. Missing or unreadable accounts, malformed
+ledgers, invalid hierarchy, and duplicate file references within a chart fail
+without printing a partial report. A file may appear in multiple charts. Separate
+charts can represent different currencies or alternative groupings. Currency
+labels in headings or prose are informational; `mdl` does not verify or convert
+currencies.
+
+```sh
+mdl balance                                      # ./chart.md
+mdl balance --chart chart-usd.md
+mdl balance --chart chart-uyu.md --as-of 2026-09-30
+mdl balance cash bank --as-of 2026-09-30
+mdl cash balance --as-of 2026-09-30 --total -q
+```
+
+`--as-of YYYY-MM-DD` selects the last entry on or before that date, including the
+last entry when several share a date. Before the first entry, the balance is zero;
+after the last entry, the closing balance carries forward. It rejects invalid
+calendar dates and ledgers with invalid or out-of-order dates. Without `--as-of`,
+the latest recorded balance is used, including future-dated entries. Like the
+existing balance command, reports read the stored balance column; use `lint` and
+`recalc` to check or correct stale balances.
+
+Explicit account lists keep the existing flat report even when `chart.md` exists.
+They cannot be combined with `--chart`. Without account files or a default chart,
+`mdl balance` reports an error.
+
+Chart reports support `--pretty`, `--markdown`, `--json`, `--csv`, `--quiet`, and
+`--total`. Markdown uses a fenced text block to preserve both indentation
+directions. JSON includes the optional title (or null), surrounding Markdown in
+`before` and `after`, as-of date (or null), nested `nodes`, and total; group nodes contain `children`, account nodes contain the configured
+`account` path. CSV uses `Path,Type,Balance,AsOf`, with group paths joined
+by ` / `. Quiet output lists every displayed group and account amount in order,
+then the total; `--total -q` prints only the total. Group rows are subtotals and
+must not be added again when processing exports.
+
 ## Interactive entry
 
 Run `mdl` without arguments to open the interactive ledger, or `mdl edit cash` to

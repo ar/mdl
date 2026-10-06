@@ -14,6 +14,10 @@
 //! save also commits the file and pushes best-effort. The account picker fetches
 //! on the way in and syncs on the way out; `edit` opens locally and leaves locally.
 //! See git.rs and tui.rs.
+#[cfg(test)]
+use ledger::balance;
+
+mod account_chart;
 mod git;
 mod chart;
 mod ledger;
@@ -25,7 +29,7 @@ use std::io::{self, IsTerminal};
 use std::path::Path;
 use std::{env, fs, process};
 
-use ledger::{Entry, add_entry, amount_arg, balance, delete_entry, edit_entry, entry_what, find_table, lint, load, move_entry, period, push_pending, recalc, recalc_diff, resolve, row_index, save_commit, scoped, today};
+use ledger::{Entry, add_entry, amount_arg, delete_entry, edit_entry, entry_what, find_table, lint, load, move_entry, period, push_pending, recalc, recalc_diff, resolve, row_index, save_commit, scoped, today};
 use print::{graph_png, graph_png_accounts, print_pdf};
 use render::{render, render_csv, render_json, render_pretty};
 use tui::{scan_accounts, tui};
@@ -56,6 +60,8 @@ Read
                                        merged by date, each description led
                                        by its account, one running balance
   mdl balance [options] <file>...      several accounts, and their sum
+  mdl balance [--chart <chart.md>]     hierarchy; defaults to ./chart.md
+             [--as-of YYYY-MM-DD]     closing balances on or before this date
                                        --total: only the total
                                        -q|--quiet: amounts only, one per line
                                        --pretty|--markdown|--json|--csv
@@ -277,7 +283,10 @@ fn cmd_balance(initial_files: &[String], args: &[String]) -> Result<(), String> 
     let mut format = None;
     let mut only_total = false;
     let mut positional = false;
-    for arg in args {
+    let mut chart = None;
+    let mut as_of = None;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
         if positional {
             files.push(resolve(arg));
             continue;
@@ -285,6 +294,15 @@ fn cmd_balance(initial_files: &[String], args: &[String]) -> Result<(), String> 
         let selected = match arg.as_str() {
             "--" => { positional = true; continue; }
             "--total" => { only_total = true; continue; }
+            "--chart" | "--as-of" => {
+                let value = args.next().filter(|v| !v.starts_with('-'))
+                    .ok_or_else(|| format!("balance: {arg} needs a value"))?;
+                let slot = if arg == "--chart" { &mut chart } else { &mut as_of };
+                if slot.replace(value.as_str()).is_some() {
+                    return Err(format!("balance: repeated {arg}"));
+                }
+                continue;
+            }
             "-q" | "--quiet" => "quiet",
             "--pretty" => "pretty",
             "--markdown" => "markdown",
@@ -298,10 +316,18 @@ fn cmd_balance(initial_files: &[String], args: &[String]) -> Result<(), String> 
         }
         format = Some(selected);
     }
-    if files.is_empty() {
-        return Err("balance needs at least one file".into());
+    if let Some(date) = as_of { account_chart::validate_date(date)?; }
+    if chart.is_some() && !files.is_empty() {
+        return Err("balance: --chart cannot be combined with account files".into());
     }
-    let accounts = files.iter().map(|f| Ok((f.clone(), balance(&load(f)?.rows))))
+    if files.is_empty() {
+        let file = chart.or_else(|| Path::new("chart.md").exists().then_some("chart.md"))
+            .ok_or("balance needs account files or a chart.md (or --chart path)")?;
+        let chart = account_chart::load_chart(file, as_of)?;
+        print!("{}", account_chart::render(&chart, as_of, format.unwrap_or("pretty"), only_total, io::stdout().is_terminal()));
+        return Ok(());
+    }
+    let accounts = files.iter().map(|f| Ok((f.clone(), account_chart::account_balance(f, as_of)?)))
         .collect::<Result<Vec<_>, String>>()?;
     print!("{}", render::render_balances(&accounts, format.unwrap_or("pretty"), only_total, io::stdout().is_terminal()));
     Ok(())

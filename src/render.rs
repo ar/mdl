@@ -172,7 +172,7 @@ pub fn render_json(title: Option<&str>, rows: &[Entry]) -> String {
 
 /// RFC 4180: a cell is quoted when it holds a comma, a quote or a line break, with
 /// quotes doubled.
-fn csv_str(s: &str) -> String {
+pub fn csv_str(s: &str) -> String {
     if s.contains([',', '"', '\n', '\r']) { format!("\"{}\"", s.replace('"', "\"\"")) } else { s.to_string() }
 }
 
