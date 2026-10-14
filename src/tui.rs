@@ -1,6 +1,6 @@
 //! Interactive data entry: raw mode, keys and mouse, the screen, the state machine.
 use std::cell::Cell;
-use std::io::{self, Read, Write};
+use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
 use std::time::{Duration, Instant};
 use std::{fs, process};
@@ -531,6 +531,8 @@ struct Tui {
     pick: (String, usize),
     git_status: Cell<GitStatus>,
     busy: Cell<Option<(&'static str, Instant)>>,
+    /// Exit progress is printed after raw mode and the statement are cleared.
+    exiting: bool,
 }
 
 impl Tui {
@@ -577,6 +579,7 @@ impl Tui {
             pick: (String::new(), 0),
             git_status: Cell::new(GitStatus::Unknown),
             busy: Cell::new(None),
+            exiting: false,
         }
     }
 
@@ -918,6 +921,10 @@ impl Tui {
     /// and syncs. Terminal input remains queued until the operation completes.
     fn animate<T: Send>(&self, label: &'static str, work: impl FnOnce() -> T + Send) -> T {
         self.busy.set(Some((label, Instant::now())));
+        #[cfg(not(test))]
+        if self.exiting && !io::stderr().is_terminal() {
+            eprintln!("{label}");
+        }
         let result = std::thread::scope(|scope| {
             let job = scope.spawn(work);
             while !job.is_finished() {
@@ -925,13 +932,26 @@ impl Tui {
                 // repaint only the independent footer during a blocking operation.
                 #[cfg(not(test))]
                 {
-                    print!("\x1b7\x1b[{};1H{}\x1b8", self.h, self.footer());
-                    io::stdout().flush().ok();
+                    if self.exiting {
+                        if io::stderr().is_terminal() {
+                            let (text, _) = self.git_indicator();
+                            eprint!("\r\x1b[2K\x1b[36m{text}\x1b[0m");
+                            io::stderr().flush().ok();
+                        }
+                    } else {
+                        print!("\x1b7\x1b[{};1H{}\x1b8", self.h, self.footer());
+                        io::stdout().flush().ok();
+                    }
                 }
                 std::thread::sleep(Duration::from_millis(80));
             }
             job.join().unwrap_or_else(|panic| std::panic::resume_unwind(panic))
         });
+        #[cfg(not(test))]
+        if self.exiting && io::stderr().is_terminal() {
+            eprint!("\r\x1b[2K");
+            io::stderr().flush().ok();
+        }
         self.busy.set(None);
         result
     }
@@ -1625,6 +1645,7 @@ impl Tui {
     /// pending), but only when there is something to push. A fixed-account screen
     /// leaves without syncing. None: nothing was done.
     fn quit_sync(&mut self) -> Option<Result<String, String>> {
+        self.exiting = true;
         if self.fixed_account || !self.git_enabled() {
             return None;
         }
@@ -2019,14 +2040,19 @@ pub fn tui(file: Option<&str>) -> Result<(), String> {
             }
         }
     }
-    // sync while still on the screen (the status line says so), report once off it
-    let note = t.quit_sync();
+    // Restore the terminal immediately; any remaining git work uses inline progress.
     drop(raw);
+    let note = t.quit_sync();
     match note {
         None => Ok(()),
         Some(Err(e)) => Err(e),
         Some(Ok(n)) => {
-            eprintln!("{n}");
+            if io::stderr().is_terminal() {
+                let color = if n.contains("push failed") { "33" } else { "2;37" };
+                eprintln!("\x1b[{color}m{n}\x1b[0m");
+            } else {
+                eprintln!("{n}");
+            }
             if n.contains("push failed") {
                 return Err("the remote may have moved on; run `mdl fetch` and push again".into());
             }
