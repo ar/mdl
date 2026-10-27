@@ -1,6 +1,7 @@
 //! mdl: ledgers as Markdown tables. The commands are in USAGE below (`mdl --help`).
 //!
-//! The ledger is the first 5-column GFM table in the file:
+//! An unnamed ledger is the first 5-column GFM table in the file. Named ledgers
+//! use `##` sections addressed as `file:ledger`. Each table has this shape:
 //! `| date | description | debit | credit | balance |`. Header labels are
 //! yours (`init` writes them in English, or Spanish with `--lang es`) and are preserved
 //! on rewrite. Transfers use `Fecha` to choose Spanish description suffixes. Empty amount cells
@@ -36,7 +37,15 @@ use render::{render, render_csv, render_json, render_pretty};
 use tui::{scan_accounts, tui};
 
 const USAGE: &str = "\
-usage: mdl [<file>[.md]] [<command> [args...]]
+usage: mdl [<file>[.md][:ledger]] [<command> [args...]]
+
+  Named ledgers: ## Checking in usd.md is usd:checking (or usd.md:checking).
+  Use lowercase heading words joined by hyphens: Emergency Fund -> emergency-fund.
+  CLI operations on named sections require file:ledger.
+  mdl init usd:checking Checking        append a named ledger (or create its file)
+  mdl edit usd                         open the document with ledger tabs
+  mdl edit usd:checking                open with Checking selected
+  Tabs: Ctrl-P/N, Ctrl-Left/Right, or click; finish/cancel entries before switching.
 
   mdl                                  interactive screen over ./**/*.md
   mdl init <file> [--lang es|en] [title...]
@@ -140,6 +149,9 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
         }
     }
     let [file, title @ ..] = &words[..] else { bad("init needs a file name") };
+    if ledger::account_parts(file).1.is_some() {
+        return init_ledger(file, title, &lang);
+    }
     let file = if file.ends_with(".md") { file.clone() } else { format!("{file}.md") };
     let stem = Path::new(&file).file_stem().map_or(file.clone(), |s| s.to_string_lossy().into_owned());
     let title = if title.is_empty() { stem.clone() } else { title.join(" ") };
@@ -161,8 +173,64 @@ fn cmd_init(args: &[String]) -> Result<(), String> {
     Ok(())
 }
 
+/// Append an explicitly named ledger, without converting an unnamed ledger silently.
+fn init_ledger(account: &str, title: &[String], lang: &str) -> Result<(), String> {
+    let (path, id) = ledger::account_parts(account);
+    let id = id.ok_or("expected file:ledger")?;
+    if id.is_empty() || ledger::ledger_id(id) != id {
+        return Err("ledger identifiers must use lowercase words separated by hyphens".into());
+    }
+    let title = if title.is_empty() { id.to_string() } else { title.join(" ") };
+    if ledger::ledger_id(&title) != id {
+        return Err(format!("heading `{title}` must produce the identifier `{id}`"));
+    }
+    let mut path = resolve(path);
+    if !Path::new(&path).exists() && !path.ends_with(".md") { path.push_str(".md"); }
+    let existing = match fs::read_to_string(&path) {
+        Ok(text) => text,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => String::new(),
+        Err(e) => return Err(format!("{path}: {e}")),
+    };
+    if existing.lines().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ")) {
+        return Err(format!("{path}: unresolved merge conflict"));
+    }
+    if Path::new(&path).exists() {
+        let tabs = ledger::ledger_tabs(&path)?;
+        if tabs.iter().any(|(a, _)| ledger::account_parts(a).1 == Some(id)) {
+            return Err(format!("{account}: ledger already exists"));
+        }
+        if tabs.is_empty() && find_table(&existing.lines().collect::<Vec<_>>()).is_ok() {
+            return Err("add a ## heading to the existing ledger before adding another".into());
+        }
+    }
+    let (_, _, table) = parts(&title, lang, &today())?;
+    let mut text = existing;
+    if !text.is_empty() {
+        if !text.ends_with('\n') { text.push('\n'); }
+        if !text.ends_with("\n\n") { text.push('\n'); }
+    }
+    text += &format!("## {title}\n\n{table}");
+    fs::write(&path, text).map_err(|e| format!("{path}: {e}"))?;
+    println!("added {id} to {path}");
+    let dir = Path::new(".");
+    if git::account_in_tree(dir, &path) && git::autocommit(dir) {
+        let note = git::commit_push(dir, &path, &format!("mdl: {}:{id} init", path.trim_end_matches(".md")))?;
+        if note != "pushed" { eprintln!("{note}"); }
+    }
+    Ok(())
+}
+
 /// Prepare an explicit interactive account, preserving existing prose and tables.
 fn prepare_edit(file: &str) -> Result<String, String> {
+    if ledger::account_parts(file).1.is_some() {
+        let resolved = resolve(file);
+        let (path, id) = ledger::account_parts(&resolved);
+        let exists = Path::new(path).exists() && ledger::ledger_tabs(path)?.iter()
+            .any(|(name, _)| ledger::account_parts(name).1 == id);
+        if !exists { init_ledger(file, &[], "en")?; }
+        load(&resolved)?;
+        return Ok(resolve(file));
+    }
     let mut file = resolve(file);
     if !Path::new(&file).exists() && !file.ends_with(".md") {
         file.push_str(".md");
@@ -179,7 +247,7 @@ fn prepare_edit(file: &str) -> Result<String, String> {
         }
         if find_table(&lines).is_ok() {
             // A malformed ledger is an error, not a reason to append another table.
-            load(&file)?;
+            load(&ledger::first_account(&file)?)?;
             return Ok(file);
         }
     }
@@ -252,6 +320,11 @@ fn check_accounts() {
     scan_accounts(Path::new("."), &mut accounts);
     accounts.sort();
     let mut stale = false;
+    let mut accounts: Vec<String> = accounts.into_iter().flat_map(|a| {
+        ledger::ledger_tabs(&a).ok().filter(|t| !t.is_empty()).map_or_else(|| vec![a], |t| t.into_iter().map(|(id, _)| id).collect())
+    }).collect();
+    accounts.sort();
+    accounts.dedup();
     for a in &accounts {
         match load(a) {
             Ok(doc) => {
@@ -410,7 +483,7 @@ fn chart_accounts(files: &[String], p: &Option<(String, String)>) -> Result<Vec<
         return Ok(vec![]);
     }
     files.iter().map(|file| {
-        let name = Path::new(file).file_stem().map_or(file.as_str().into(), |s| s.to_string_lossy().into_owned());
+        let name = ledger::account_name(file);
         Ok((name, scoped(load(file)?, p)))
     }).collect()
 }
@@ -455,7 +528,7 @@ fn run() -> Result<(), String> {
     // More accounts may follow the first (a shell glob, say): every word up to the
     // command that names an existing file. show, print and graph combine them.
     const COMMANDS: [&str; 13] = ["show", "print", "graph", "lint", "balance", "recalc", "debit", "credit", "note", "edit", "move", "flag", "delete"];
-    let n = 1 + args[1..].iter().take_while(|a| !COMMANDS.contains(&a.as_str()) && Path::new(&resolve(a)).is_file()).count();
+    let n = 1 + args[1..].iter().take_while(|a| !COMMANDS.contains(&a.as_str()) && Path::new(ledger::account_parts(&resolve(a)).0).is_file()).count();
     let files: Vec<String> = args[..n].iter().map(|f| resolve(f)).collect();
     // Display flags and period selectors imply `show`; validation stays in the
     // same period parser used by `print`.
@@ -474,8 +547,12 @@ fn run() -> Result<(), String> {
         &files[0]
     } else if cmd == "show" || cmd == "print" || cmd == "graph" {
         // ponytail: the PDF is named after every stem; a long glob makes a long name
-        let stems: Vec<String> = files.iter().map(|f| Path::new(f).file_stem().unwrap_or_default().to_string_lossy().into_owned()).collect();
-        combined = Path::new(&files[0]).with_file_name(stems.join("+")).with_extension("md").to_string_lossy().into_owned();
+        let stems: Vec<String> = files.iter().map(|f| {
+            let (path, id) = ledger::account_parts(f);
+            let stem = Path::new(path).file_stem().unwrap_or_default().to_string_lossy();
+            id.map_or_else(|| stem.to_string(), |id| format!("{stem}-{id}"))
+        }).collect();
+        combined = Path::new(ledger::account_parts(&files[0]).0).with_file_name(stems.join("+")).with_extension("md").to_string_lossy().into_owned();
         &combined
     } else {
         bad(&format!("{cmd} takes one account; only show, print and graph combine several"))

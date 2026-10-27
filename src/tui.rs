@@ -1,4 +1,5 @@
 //! Interactive data entry: raw mode, keys and mouse, the screen, the state machine.
+use crate::ledger::{account_parts, account_name, first_account, ledger_tabs};
 use std::cell::Cell;
 use std::io::{self, IsTerminal, Read, Write};
 use std::path::Path;
@@ -48,6 +49,8 @@ fn term_size() -> (usize, usize) {
 #[derive(Debug, PartialEq)]
 enum Key {
     Char(char),
+    TabLeft,
+    TabRight,
     Enter,
     Backspace,
     Next,
@@ -120,6 +123,8 @@ fn read_key(stdin: &mut impl Read) -> Key {
             b'\r' | b'\n' => Key::Enter,
             0x7f => Key::Backspace,
             0x08 => Key::History,
+            0x10 => Key::TabLeft,
+            0x0e => Key::TabRight,
             b'\t' => Key::Next,
             0x03 => Key::Esc,
             0x04 => Key::Delete,
@@ -147,6 +152,8 @@ fn read_key(stdin: &mut impl Read) -> Key {
                     b"[3~" => Key::Delete,
                     b"[1;2A" => Key::MoveUp,
                     b"[1;2B" => Key::MoveDown,
+                    b"[1;5D" => Key::TabLeft,
+                    b"[1;5C" => Key::TabRight,
                     b"[5~" => Key::PageUp,
                     b"[6~" => Key::PageDown,
                     s => match parse_mouse(s) {
@@ -185,7 +192,11 @@ pub fn scan_accounts(dir: &Path, out: &mut Vec<String>) {
         if p.is_dir() {
             scan_accounts(&p, out);
         } else if name.ends_with(".md") {
-            out.push(p.strip_prefix("./").unwrap_or(&p).to_string_lossy().into_owned());
+            let path = p.strip_prefix("./").unwrap_or(&p).to_string_lossy().into_owned();
+            if let Ok(tabs) = ledger_tabs(&path) {
+                out.extend(tabs.into_iter().map(|(id, _)| id));
+            }
+            out.push(path);
         }
     }
 }
@@ -245,9 +256,9 @@ fn fuzzy_score(s: &str, q: &str) -> Option<i64> {
 /// The accounts `q` fuzzy-matches, best first (ties: shorter, then alphabetical), as
 /// names without `.md`.
 fn account_matches(q: &str, accounts: &[String]) -> Vec<String> {
-    let mut hits: Vec<(i64, &String)> = accounts.iter().filter_map(|p| fuzzy_score(p.trim_end_matches(".md"), q.trim()).map(|s| (s, p))).collect();
+    let mut hits: Vec<(i64, &String)> = accounts.iter().filter_map(|p| fuzzy_score(&account_name(p), q.trim()).map(|s| (s, p))).collect();
     hits.sort_by(|a, b| b.0.cmp(&a.0).then(a.1.len().cmp(&b.1.len())).then(a.1.cmp(b.1)));
-    hits.into_iter().map(|(_, p)| p.trim_end_matches(".md").to_string()).collect()
+    hits.into_iter().map(|(_, p)| account_name(p)).collect()
 }
 
 /// Map what was typed in the account field to a file from `accounts`: an exact path
@@ -255,7 +266,7 @@ fn account_matches(q: &str, accounts: &[String]) -> Vec<String> {
 /// match (see `fuzzy_score`). Several files with the same name are an error listing them.
 fn resolve_account(id: &str, accounts: &[String]) -> Result<String, String> {
     let with_md = format!("{id}.md");
-    if let Some(p) = accounts.iter().find(|p| **p == with_md || **p == id) {
+    if let Some(p) = accounts.iter().find(|p| **p == with_md || **p == id || account_name(p) == id) {
         return Ok(p.clone());
     }
     let stem = |p: &String| p.rsplit('/').next().unwrap_or(p).trim_end_matches(".md").to_string();
@@ -266,7 +277,7 @@ fn resolve_account(id: &str, accounts: &[String]) -> Result<String, String> {
         [] => {}
     }
     match account_matches(id, accounts).first() {
-        Some(name) => Ok(format!("{name}.md")),
+        Some(name) => Ok(accounts.iter().find(|p| account_name(p) == *name).unwrap().clone()),
         None => Err(format!("{id}: no such account")),
     }
 }
@@ -490,6 +501,8 @@ struct Tui {
     /// with a value.
     select: bool,
     account: Option<(String, Doc)>,
+    tabs: Vec<(String, String)>,
+    tab_views: Vec<(String, Option<usize>, usize)>,
     /// Rendered statement, each line with the entry it belongs to.
     lines: Vec<(String, Option<usize>)>,
     /// First statement line on screen.
@@ -556,6 +569,8 @@ impl Tui {
             cur: usize::MAX,
             select: false,
             account: None,
+            tabs: vec![],
+            tab_views: vec![],
             lines: vec![],
             top: 0,
             sel: None,
@@ -589,7 +604,9 @@ impl Tui {
 
     fn stem(&self) -> String {
         self.account.as_ref().map(|(p, _)| {
-            if self.fixed_account {
+            if account_parts(p).1.is_some() {
+                account_name(p)
+            } else if self.fixed_account {
                 Path::new(p).file_stem().unwrap_or_default().to_string_lossy().into_owned()
             } else {
                 p.trim_end_matches(".md").to_string()
@@ -601,6 +618,9 @@ impl Tui {
 
     /// Re-render the statement after the account or its rows changed.
     fn rebuild(&mut self) {
+        let had_tabs = usize::from(!self.tabs.is_empty());
+        self.tabs = self.account.as_ref().and_then(|(p, _)| ledger_tabs(p).ok()).unwrap_or_default();
+        self.view = (self.view + had_tabs).saturating_sub(usize::from(!self.tabs.is_empty()));
         let mut lines = vec![];
         if let Some((path, doc)) = &self.account {
             let g = grid(&doc.rows, false);
@@ -642,6 +662,7 @@ impl Tui {
 
     /// The entry drawn on screen row `y` (1-based), if any.
     fn entry_at(&self, y: usize) -> Option<usize> {
+        let y = y.saturating_sub(usize::from(!self.tabs.is_empty()));
         let pad = self.view.saturating_sub(self.lines.len());
         if y == 0 || y > self.view || y <= pad {
             return None;
@@ -700,6 +721,11 @@ impl Tui {
             return self.history_view();
         }
         let mut out = String::from("\x1b[?25l\x1b[H");
+        if !self.tabs.is_empty() {
+            let strip = self.visible_tabs().into_iter().map(|(_, label)| label).collect::<Vec<_>>().join(" ");
+            let strip = format!("{strip}  · Ctrl-P/N tabs");
+            out += &format!("\x1b[2K{}\r\n", clipped(&strip, self.cols));
+        }
         let pad = self.view.saturating_sub(self.lines.len());
         for r in 0..self.view {
             out += "\x1b[2K";
@@ -752,7 +778,7 @@ impl Tui {
         }
         if self.panel_expanded() {
             let title = if let Some(draft) = &self.counterpart {
-                if draft.transfer { format!("Transfer counterpart from {}", draft.source.trim_end_matches(".md")) }
+                if draft.transfer { format!("Transfer counterpart from {}", account_name(&draft.source)) }
                 else { format!("Reverse row {}", draft.row + 1) }
             } else { match self.editing {
                 Some(i) if self.insert => format!("Insert below row {}", i + 1),
@@ -794,7 +820,7 @@ impl Tui {
         out += "\r\n";
         out += &self.footer();
         if let Some(q) = &self.search {
-            out += &format!("\x1b[{};{}H\x1b[?25h", self.view + 1, (2 + q.chars().count()).min(self.cols));
+            out += &format!("\x1b[{};{}H\x1b[?25h", self.view + usize::from(!self.tabs.is_empty()) + 1, (2 + q.chars().count()).min(self.cols));
         } else if self.sel.is_none() || self.edit_form() {
             let col = cell_start(&self.w, self.focus) + view(self.focus).1;
             out += &format!("\x1b[{};{}H\x1b[?25h", self.field_row(), col + 1);
@@ -813,7 +839,7 @@ impl Tui {
         let mut headers = vec!["Date", "Account", "Description", "Debit", "Credit"];
         if !show_account { headers.remove(1); }
         let rows: Vec<Vec<String>> = self.posts.iter().rev().map(|(path, e)| {
-            let mut row = vec![e.date.clone(), path.trim_end_matches(".md").to_string(),
+            let mut row = vec![e.date.clone(), account_name(path),
                 e.desc.clone(), fmt_col(e.debit), fmt_col(e.credit)];
             if !show_account { row.remove(1); }
             row
@@ -890,7 +916,7 @@ impl Tui {
     fn resize(&mut self, h: usize, cols: usize) {
         self.h = h;
         self.cols = cols;
-        self.view = h.saturating_sub(if self.panel_expanded() { 6 } else { 3 });
+        self.view = h.saturating_sub(if self.panel_expanded() { 6 } else { 3 }).saturating_sub(usize::from(!self.tabs.is_empty()));
         if self.account.is_none() {
             let header = ["date", "description", "debit", "credit", "balance"].map(String::from);
             self.w = tui_widths(&header, &[], cols, self.account_w);
@@ -903,7 +929,7 @@ impl Tui {
     }
 
     fn field_row(&self) -> usize {
-        self.view + if self.panel_expanded() { 4 } else { 2 }
+        self.view + usize::from(!self.tabs.is_empty()) + if self.panel_expanded() { 4 } else { 2 }
     }
 
     fn git_indicator(&self) -> (String, u8) {
@@ -1015,7 +1041,7 @@ impl Tui {
     fn exact_account(&self) -> bool {
         let id = self.fields[0].trim();
         let with_md = format!("{id}.md");
-        self.accounts.iter().any(|p| *p == with_md || *p == id || p.rsplit('/').next().unwrap_or(p).trim_end_matches(".md") == id)
+        self.accounts.iter().any(|p| *p == with_md || *p == id || account_name(p) == id || p.rsplit('/').next().unwrap_or(p).trim_end_matches(".md") == id)
     }
 
     /// Index of the highlighted match for the field's current text.
@@ -1216,7 +1242,7 @@ impl Tui {
             return Ok(String::new());
         }
         let result = if self.autocommit {
-            self.animate("Saving…", || git::commit_push(self.dir, path, &format!("mdl: {} {what}", path.trim_end_matches(".md"))))
+            self.animate("Saving…", || git::commit_push(self.dir, account_parts(path).0, &format!("mdl: {} {what}", account_name(path))))
         } else {
             Ok(String::new())
         };
@@ -1282,7 +1308,7 @@ impl Tui {
             opened = false;
             // the highlighted match when there is a list, else the name as typed
             let target = match self.completions().get(self.pick()) {
-                Some(name) if !self.exact_account() => Ok(format!("{name}.md")),
+                Some(name) if !self.exact_account() => resolve_account(name, &self.accounts),
                 _ => resolve_account(&id, &self.accounts),
             };
             match target.and_then(|path| self.open_path(&path)) {
@@ -1298,12 +1324,14 @@ impl Tui {
 
     /// Open an exact path, including accounts supplied on the command line.
     fn open_path(&mut self, path: &str) -> Result<(), String> {
+        let selected = first_account(path)?;
+        let path = selected.as_str();
         load_for_tui(path)?;
         // An earlier account's fetch must finish before changing scope. A fetch
         // error must not prevent opening a local account.
         let _ = self.finish_pull();
         let previous = (self.account_git, self.autocommit);
-        self.account_git = self.in_repo && git::account_in_tree(self.dir, path);
+        self.account_git = self.in_repo && git::account_in_tree(self.dir, account_parts(path).0);
         self.autocommit = self.git_enabled() && git::autocommit(self.dir);
         let pulled = if self.fixed_account { Ok(String::new()) } else { self.pull_if_due() };
         // A failed merge leaves markers the parser refuses: say why.
@@ -1397,12 +1425,14 @@ impl Tui {
         let _ = self.finish_pull();
         let id = self.fields[0].trim();
         let target = match self.completions().get(self.pick()) {
-            Some(name) if !self.exact_account() => Ok(format!("{name}.md")),
+            Some(name) if !self.exact_account() => resolve_account(name, &self.accounts),
             _ => resolve_account(id, &self.accounts),
         };
         let result = target.and_then(|path| {
             let source = &self.counterpart.as_ref().unwrap().source;
-            if fs::canonicalize(&path).ok() == fs::canonicalize(source).ok() {
+            let path = first_account(&path)?;
+            if fs::canonicalize(account_parts(&path).0).ok() == fs::canonicalize(account_parts(source).0).ok()
+                && account_parts(&path).1 == account_parts(source).1 {
                 return Err("choose a different destination account".into());
             }
             let (doc, offer) = load_for_tui(&path)?;
@@ -1410,7 +1440,7 @@ impl Tui {
                 return Err("destination balances need recalculation; open that account first".into());
             }
             let from = if doc.header.first().is_some_and(|h| h.trim().eq_ignore_ascii_case("fecha")) { "de" } else { "from" };
-            let account = Path::new(source).file_stem().unwrap_or_default().to_string_lossy();
+            let account = if account_parts(source).1.is_some() { account_name(source) } else { Path::new(source).file_stem().unwrap_or_default().to_string_lossy().into_owned() };
             self.fields[1].push_str(&format!(" ({from} {account})"));
             // Keep the source available without changing or writing it.
             let origin = self.account.replace((path.clone(), doc));
@@ -1418,7 +1448,7 @@ impl Tui {
             draft.origin = origin;
             draft.choosing = false;
             self.fields[0] = draft.date.clone();
-            self.account_git = self.in_repo && git::account_in_tree(self.dir, &path);
+            self.account_git = self.in_repo && git::account_in_tree(self.dir, account_parts(&path).0);
             self.autocommit = self.git_enabled() && git::autocommit(self.dir);
             self.set_focus(if self.fields[2].is_empty() { 3 } else { 2 });
             self.msg.clear();
@@ -1791,6 +1821,49 @@ impl Tui {
     }
 
     /// One key; false means quit.
+    /// Keep the active tab visible even with many ledgers or long titles.
+    fn visible_tabs(&self) -> Vec<(usize, String)> {
+        let active = self.account.as_ref().and_then(|(p, _)| self.tabs.iter().position(|(id, _)| id == p)).unwrap_or(0);
+        let room = self.cols.saturating_sub(20).max(8);
+        let labels: Vec<String> = self.tabs.iter().enumerate().map(|(i, (_, title))| {
+            let title = clipped(title, room.saturating_sub(2));
+            if i == active { format!("[{title}]") } else { format!(" {title} ") }
+        }).collect();
+        let mut start = 0;
+        while start < active && labels[start..=active].iter().map(|s| s.chars().count() + 1).sum::<usize>() > room + 1 {
+            start += 1;
+        }
+        let mut used = 0;
+        labels.into_iter().enumerate().skip(start).take_while(|(_, label)| {
+            used += label.chars().count() + 1;
+            used <= room + 1
+        }).collect()
+    }
+
+    fn switch_tab(&mut self, index: usize) {
+        if self.edit_form() || self.counterpart.is_some() || self.drag.is_some()
+            || self.search.is_some() || self.offer_recalc || self.fields[1..].iter().any(|f| !f.is_empty()) {
+            self.msg = "finish or cancel the current entry before switching tabs".into();
+            return;
+        }
+        let Some((target, _)) = self.tabs.get(index).cloned() else { return };
+        if let Some((path, _)) = &self.account {
+            self.tab_views.retain(|(p, _, _)| p != path);
+            self.tab_views.push((path.clone(), self.sel, self.top));
+        }
+        match self.open_path(&target) {
+            Ok(()) => {
+                self.fields = [self.stem(), String::new(), String::new(), String::new(), String::new()];
+                if let Some((_, sel, top)) = self.tab_views.iter().find(|(p, _, _)| p == &target) {
+                    self.sel = sel.filter(|i| *i < self.rows().len());
+                    self.top = *top;
+                    self.clamp_top();
+                }
+            }
+            Err(e) => self.msg = e,
+        }
+    }
+
     fn handle(&mut self, key: Key) -> bool {
         if key == Key::Idle {
             return true;
@@ -1798,6 +1871,24 @@ impl Tui {
         if self.history_scroll.is_some() {
             self.history_key(&key);
             return true;
+        }
+        if matches!(key, Key::TabLeft | Key::TabRight) {
+            if !self.tabs.is_empty() {
+                let current = self.account.as_ref().and_then(|(p, _)| self.tabs.iter().position(|(id, _)| id == p)).unwrap_or(0);
+                let delta = if key == Key::TabRight { 1 } else { self.tabs.len() - 1 };
+                self.switch_tab((current + delta) % self.tabs.len());
+            }
+            return true;
+        }
+        if let Key::Click(x, 1) = key {
+            if !self.tabs.is_empty() {
+                let mut end = 0;
+                for (index, label) in self.visible_tabs() {
+                    end += label.chars().count() + 1;
+                    if x <= end { self.switch_tab(index); break; }
+                }
+                return true;
+            }
         }
         if key == Key::History {
             self.history_scroll = Some(0);
@@ -1983,7 +2074,7 @@ impl Tui {
                 (None, Some(i)) => self.start_edit(i),
                 _ => self.enter(),
             },
-            Key::Idle | Key::History => {}
+            Key::Idle | Key::History | Key::TabLeft | Key::TabRight => {}
         }
         if self.fields[0] != account_before {
             self.pick = (String::new(), 0); // new text: the first match is highlighted
@@ -1995,7 +2086,7 @@ impl Tui {
 pub fn tui(file: Option<&str>) -> Result<(), String> {
     // Report invalid accounts before changing the terminal or starting a fetch.
     if let Some(path) = file {
-        load_for_tui(path)?;
+        load_for_tui(&first_account(path)?)?;
     }
     let raw = Raw::enter().ok_or("not a terminal")?;
     let mut stdin = io::stdin().lock();
@@ -2082,6 +2173,63 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn named_tabs_switch_preserve_selection_and_transfer_within_document() {
+        let dir = std::env::temp_dir().join(format!("mdl-tabs-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("usd.md");
+        let path = file.to_str().unwrap();
+        let sample = cash_head(5);
+        fs::write(&file, format!("# USD\n{}\n{}", sample.replace("# Cash", "## Checking"), sample.replace("# Cash", "## Savings"))).unwrap();
+        let checking = format!("{path}:checking");
+        let savings = format!("{path}:savings");
+        let mut t = Tui::new();
+        t.fixed_account = true;
+        t.in_repo = false;
+        t.accounts = vec![path.into(), checking.clone(), savings.clone()];
+        t.open_path(path).unwrap();
+        t.resize(24, 100);
+        assert_eq!(t.account.as_ref().unwrap().0, checking);
+        assert!(without_ansi(&t.draw()).contains("[Checking]  Savings"));
+        assert_eq!(t.draw().matches("\r\n").count(), 23);
+        assert_eq!(t.field_row(), 22);
+        t.sel = Some(1);
+        t.handle(Key::TabRight);
+        assert_eq!(t.account.as_ref().unwrap().0, savings);
+        t.handle(Key::TabLeft);
+        assert_eq!(t.sel, Some(1));
+        t.fields[1] = "Unfinished entry".into();
+        t.handle(Key::TabRight);
+        assert_eq!(t.account.as_ref().unwrap().0, checking);
+        assert!(t.msg.contains("finish or cancel"));
+        t.fields[1].clear();
+        t.handle(Key::Click(16, 1));
+        assert_eq!(t.account.as_ref().unwrap().0, savings);
+        t.handle(Key::TabLeft);
+        t.handle(Key::Char('t'));
+        t.fields[0] = account_name(&savings);
+        t.choose_counterpart_account();
+        assert_eq!(t.account.as_ref().unwrap().0, savings, "{}", t.msg);
+        t.submit_counterpart();
+        assert!(t.counterpart.is_none(), "{}", t.msg);
+        assert_eq!(t.account.as_ref().unwrap().0, checking);
+        assert_eq!(load(&savings).unwrap().rows.len(), 6);
+        assert_eq!(load(&checking).unwrap().rows.len(), 5);
+        // The cached source can save again without restoring the old Savings table.
+        t.flag(1);
+        assert!(load(&checking).unwrap().rows[1].bold);
+        assert_eq!(load(&savings).unwrap().rows.len(), 6);
+        t.handle(Key::TabRight);
+        assert_eq!(t.rows().len(), 6);
+        t.handle(Key::Sync);
+        assert_eq!(t.account.as_ref().unwrap().0, savings);
+        t.resize(12, 30);
+        assert!(without_ansi(&t.draw()).contains("[Savings]"));
+        t.handle(Key::TabLeft);
+        assert!(without_ansi(&t.draw()).contains("[Checking]"));
+        fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]
@@ -2681,7 +2829,7 @@ mod tests {
         for i in 0..30 {
             rows.push(Entry { date: format!("2026-09-{:02}", i % 28 + 1), desc: format!("fila {i}"), debit: 100, credit: 0, balance: 100 * (i + 1), bold: false });
         }
-        let doc = Doc { lines: vec![], start: 0, end: 0, header: ["F", "D", "De", "H", "S"].iter().map(|s| s.to_string()).collect(), rows };
+        let doc = Doc { source_table: Default::default(), lines: vec![], start: 0, end: 0, header: ["F", "D", "De", "H", "S"].iter().map(|s| s.to_string()).collect(), rows };
         t.account = Some(("x.md".into(), doc));
         t.rebuild();
         assert_eq!(t.lines.len(), 37);

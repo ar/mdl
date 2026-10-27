@@ -107,7 +107,7 @@ fn nodes(
     index: &mut usize,
     depth: usize,
     base: &Path,
-    seen: &mut HashSet<std::path::PathBuf>,
+    seen: &mut HashSet<(std::path::PathBuf, Option<String>)>,
     as_of: Option<&str>,
 ) -> Result<Vec<Node>, String> {
     let mut result = Vec::new();
@@ -128,8 +128,8 @@ fn nodes(
         let mut history = Vec::new();
         let amount = if let Some(file) = &item.file {
             let path = resolve(&base.join(file).to_string_lossy());
-            let canonical = fs::canonicalize(&path).map_err(|e| format!("{path}: {e}"))?;
-            if !seen.insert(canonical) {
+            let canonical = fs::canonicalize(crate::ledger::account_parts(&path).0).map_err(|e| format!("{path}: {e}"))?;
+            if !seen.insert((canonical, crate::ledger::account_parts(&path).1.map(str::to_string))) {
                 return Err(format!("line {}: duplicate account `{file}`", item.line));
             }
             history = load(&path)?.rows;

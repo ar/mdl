@@ -1,6 +1,7 @@
 # mdl
 
-Ledgers as Markdown tables. Each account is a `.md` file whose first 5-column table is
+Ledgers as Markdown tables. An account can be a `.md` file or a named ledger within
+one. An ordinary single-account file uses its first 5-column table:
 `| date | description | debit | credit | balance |`; `mdl` edits it from the terminal,
 checks it, and prints it. A `|` in a description is written `\|` in the file, as GFM
 reads it, so the table stays a table.
@@ -18,6 +19,76 @@ mdl init caja Caja       # a new account, caja.md, with the table template
 mdl caja.md              # show the statement
 mdl caja.md print        # typeset it as caja.pdf
 ```
+
+## Multiple ledgers in one document
+
+Use a level-two heading (`##`) for each ledger in a shared document. For example,
+`usd.md` can contain:
+
+```markdown
+# USD
+
+## Checking
+
+| Date | Description | Debit | Credit | Balance |
+|------|-------------|------:|-------:|--------:|
+| 2026-10-01 | Opening | 100 | | 100 |
+
+## Emergency Fund
+
+| Date | Description | Debit | Credit | Balance |
+|------|-------------|------:|-------:|--------:|
+| 2026-10-01 | Opening | 500 | | 500 |
+```
+
+Address these accounts as `usd:checking` and `usd:emergency-fund`.
+`usd.md:checking` also works, as does `accounts/usd:checking` for a nested file.
+The colon separates the document path from the ledger identifier; it is reserved
+in account references. Dots and slashes keep their filename and directory meanings.
+
+Identifiers come from headings: lowercase letters and numbers, with punctuation
+and whitespace replaced by hyphens. Titles can use any language. Duplicate or
+empty identifiers are rejected. Renaming a heading changes its identifier, so
+update commands and chart references that use it.
+
+```sh
+mdl init usd:checking Checking
+mdl init usd:emergency-fund Emergency Fund
+mdl usd:checking debit 25 Deposit
+mdl usd:emergency-fund credit 10 Withdrawal
+mdl balance usd:checking usd:emergency-fund
+mdl usd:checking usd:emergency-fund show
+mdl usd:checking print                      # usd-checking.pdf
+mdl edit usd                                # document with ledger tabs
+mdl edit usd:emergency-fund                 # select Emergency Fund initially
+```
+
+`init file:ledger` appends a named ledger, creating the document if needed. Its
+optional title must produce the requested identifier. `edit file:ledger` also
+creates a missing ledger. To extend an existing ordinary account, first add a
+`##` heading above its existing table; the existing `#` document title may stay.
+Existing unnamed single-account documents keep their original commands.
+
+Once a document uses named ledger sections, CLI reads and writes require a
+qualified name, even if it currently contains only one named ledger. A bare
+`mdl edit usd` or selecting `usd` in the interactive account picker opens the
+first tab. Switch tabs with **Ctrl-P / Ctrl-N**, **Ctrl-Left / Ctrl-Right**, or a
+mouse click. Selection and scrolling are remembered per tab. Finish or cancel
+an unfinished entry before switching; Ctrl-L clears the entry. An explicit edit
+session stays within that document, with transfers still able to use other accounts.
+
+Each ledger has independent rows, balances, and column labels. Transfers and
+session history use qualified account names. Account charts accept references
+such as `[Checking](usd:checking)` and can include several ledgers from the same
+file; duplicate references to the same ledger are rejected.
+
+Use one ledger table per `##` section, and name every ledger in a shared document.
+A section ends at the next `#` or `##` heading. Fenced Markdown examples are
+ignored. Printing includes the selected section's prose and table, without sibling
+sections or the document preamble. Saving replaces only the selected table and
+preserves surrounding text and sibling ledgers. If that same table has changed
+on disk since it was loaded, saving fails with a reload message. Git commits
+continue to operate on the physical Markdown file.
 
 ## Sample
 
@@ -104,7 +175,7 @@ terminal. Account signs are preserved: group names such as Assets and Liabilitie
 do not change arithmetic. The final total sums each account once.
 
 Only listed accounts participate. Missing or unreadable accounts, malformed
-ledgers, invalid hierarchy, and duplicate file references within a chart fail
+ledgers, invalid hierarchy, and duplicate account references within a chart fail
 without printing a partial report. A file may appear in multiple charts. Separate
 charts can represent different currencies or alternative groupings. Currency
 labels in headings or prose are informational; `mdl` does not verify or convert
@@ -197,8 +268,9 @@ open it with a specific account loaded and the description field ready for entry
 If the file is missing, it is created with the default English ledger table and a
 zero opening balance dated today. If the file exists without a ledger table, the
 table is appended, preserving its text. Existing ledgers are opened as they are.
-This session stays on that account: the account field shows only its filename
-without `.md` and cannot be changed. Ctrl-L clears the entry while keeping the
+This session stays on that document: an ordinary account shows its filename
+without `.md`; a named ledger shows its qualified name and provides sibling tabs.
+The account field cannot be changed. Ctrl-L clears the entry while keeping the
 account open. Run plain `mdl` to switch between accounts.
 
 `mdl edit <file>` opens the local account without fetching and exits without

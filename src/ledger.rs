@@ -148,9 +148,11 @@ fn is_separator(line: &str) -> bool {
 
 /// (header_line, end_line_exclusive, header_labels) of the first 5-column table.
 pub fn find_table(lines: &[&str]) -> Result<(usize, usize, Vec<String>), String> {
+    let visible = outside_fences(lines);
     let start = lines
         .windows(2)
-        .position(|w| cells(w[0]).is_some_and(|c| c.len() == 5) && is_separator(w[1]))
+        .enumerate()
+        .position(|(i, w)| visible[i] && visible[i + 1] && cells(w[0]).is_some_and(|c| c.len() == 5) && is_separator(w[1]))
         .ok_or("no 5-column table found")?;
     let end = lines[start + 2..].iter().position(|l| cells(l).is_none()).map_or(lines.len(), |n| start + 2 + n);
     Ok((start, end, cells(lines[start]).unwrap()))
@@ -326,6 +328,8 @@ pub fn recalc(rows: &mut [Entry]) {
 }
 
 pub struct Doc {
+    /// Last observed table, used to reject stale writes to a named ledger.
+    pub source_table: std::cell::RefCell<Option<String>>,
     pub lines: Vec<String>,
     pub start: usize,
     pub end: usize,
@@ -333,8 +337,95 @@ pub struct Doc {
     pub rows: Vec<Entry>,
 }
 
+/// A logical account consists of a physical Markdown path and optional section id.
+pub fn account_parts(account: &str) -> (&str, Option<&str>) {
+    match account.split_once(':') {
+        Some((file, id)) => (file, Some(id)),
+        None => (account, None),
+    }
+}
+
+pub fn account_name(account: &str) -> String {
+    let (file, id) = account_parts(account);
+    let file = file.trim_end_matches(".md");
+    id.map_or_else(|| file.to_string(), |id| format!("{file}:{id}"))
+}
+
+pub fn ledger_id(title: &str) -> String {
+    title.to_lowercase().split(|c: char| !c.is_alphanumeric())
+        .filter(|s| !s.is_empty()).collect::<Vec<_>>().join("-")
+}
+
+/// Ignore Markdown fenced examples when identifying headings and tables.
+fn outside_fences(lines: &[&str]) -> Vec<bool> {
+    let mut fence: Option<(char, usize)> = None;
+    lines.iter().map(|line| {
+        let text = line.trim_start();
+        let ch = text.chars().next().unwrap_or(' ');
+        let n = text.chars().take_while(|&c| c == ch).count();
+        if let Some((mark, size)) = fence {
+            if ch == mark && n >= size && text[n..].trim().is_empty() { fence = None; }
+            false
+        } else if (ch == '`' || ch == '~') && n >= 3 {
+            fence = Some((ch, n));
+            false
+        } else { true }
+    }).collect()
+}
+
+/// Named ledgers use level-two headings. Bounds include section prose but no siblings.
+fn sections(lines: &[&str]) -> Result<Vec<(String, String, usize, usize)>, String> {
+    let visible = outside_fences(lines);
+    let headings: Vec<usize> = lines.iter().enumerate().filter_map(|(i, l)|
+        (visible[i] && (l.starts_with("## ") || l.starts_with("# "))).then_some(i)).collect();
+    let mut result = Vec::new();
+    for (n, &start) in headings.iter().enumerate() {
+        let Some(title) = lines[start].strip_prefix("## ") else { continue };
+        let end = headings.get(n + 1).copied().unwrap_or(lines.len());
+        if let Ok((_, table_end, _)) = find_table(&lines[start..end]) {
+            if find_table(&lines[start + table_end..end]).is_ok() {
+                return Err(format!("section `{title}` has more than one ledger table"));
+            }
+            let title = title.trim().trim_end_matches('#').trim();
+            let id = ledger_id(title);
+            if id.is_empty() { return Err("ledger heading needs a name".into()); }
+            if result.iter().any(|(other, _, _, _)| other == &id) {
+                return Err(format!("duplicate ledger identifier `{id}`"));
+            }
+            result.push((id, title.to_string(), start, end));
+        }
+    }
+    if !result.is_empty() {
+        let mut offset = 0;
+        while let Ok((first, table_end, _)) = find_table(&lines[offset..]) {
+            let first = offset + first;
+            if !result.iter().any(|(_, _, start, end)| first >= *start && first < *end) {
+                return Err("name every ledger with a ## heading before adding named ledgers".into());
+            }
+            offset += table_end;
+        }
+    }
+    Ok(result)
+}
+
+pub fn ledger_tabs(account: &str) -> Result<Vec<(String, String)>, String> {
+    let file = resolve(account_parts(account).0);
+    let text = fs::read_to_string(&file).map_err(|e| format!("{file}: {e}"))?;
+    Ok(sections(&text.lines().collect::<Vec<_>>())?.into_iter()
+        .map(|(id, title, _, _)| (format!("{file}:{id}"), title)).collect())
+}
+
+/// TUI document opening selects the first tab; CLI reads require a section name.
+pub fn first_account(account: &str) -> Result<String, String> {
+    if account_parts(account).1.is_some() { return Ok(resolve(account)); }
+    Ok(ledger_tabs(account)?.first().map_or_else(|| resolve(account), |(id, _)| id.clone()))
+}
+
 /// `foo` resolves to `foo.md` when `foo` does not exist but `foo.md` does.
 pub fn resolve(file: &str) -> String {
+    if let Some((path, id)) = file.split_once(':') {
+        return format!("{}:{id}", resolve(path));
+    }
     let with_md = format!("{file}.md");
     if !Path::new(file).exists() && Path::new(&with_md).exists() {
         with_md
@@ -344,15 +435,27 @@ pub fn resolve(file: &str) -> String {
 }
 
 pub fn load(file: &str) -> Result<Doc, String> {
-    let text = fs::read_to_string(file).map_err(|e| format!("{file}: {e}"))?;
-    let lines: Vec<&str> = text.lines().collect();
+    let resolved = resolve(file);
+    let (path, selected) = account_parts(&resolved);
+    let text = fs::read_to_string(path).map_err(|e| format!("{file}: {e}"))?;
+    let all_lines: Vec<&str> = text.lines().collect();
+    let named = sections(&all_lines)?;
+    let mut offset = 0;
+    let lines = if let Some(id) = selected {
+        let (_, _, start, end) = named.iter().find(|(name, _, _, _)| name == id)
+            .ok_or_else(|| format!("{file}: no such ledger `{id}`"))?;
+        offset = *start;
+        all_lines[*start..*end].to_vec()
+    } else if !named.is_empty() {
+        return Err(format!("{file}: select a ledger: {}", named.iter().map(|(id, _, _, _)| format!("{}:{id}", account_name(path))).collect::<Vec<_>>().join(", ")));
+    } else { all_lines.clone() };
     // a marker inside the table would otherwise just end it, silently dropping rows
-    if lines.iter().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ")) {
+    if all_lines.iter().any(|l| l.starts_with("<<<<<<< ") || l.starts_with(">>>>>>> ")) {
         return Err(format!("{file}: unresolved merge conflict"));
     }
     let (start, end, header) = find_table(&lines).map_err(|e| format!("{file}: {e}"))?;
-    let rows = parse_rows(&lines[start + 2..end], start + 3).map_err(|e| format!("{file}: {e}"))?;
-    Ok(Doc { lines: lines.iter().map(|l| l.to_string()).collect(), start, end, header, rows })
+    let rows = parse_rows(&lines[start + 2..end], offset + start + 3).map_err(|e| format!("{file}: {e}"))?;
+    Ok(Doc { source_table: std::cell::RefCell::new(selected.map(|_| lines[start..end].join("\n"))), lines: lines.iter().map(|l| l.to_string()).collect(), start, end, header, rows })
 }
 
 /// Several accounts as one: their rows merged in date order (stable, so a day keeps
@@ -364,7 +467,7 @@ pub fn combine(files: &[String]) -> Result<Doc, String> {
     let mut header = vec![];
     for f in files {
         let doc = load(f)?;
-        let stem = Path::new(f).file_stem().map_or(f.clone(), |s| s.to_string_lossy().into_owned());
+        let stem = if account_parts(f).1.is_some() { account_name(f) } else { Path::new(f).file_stem().map_or(f.clone(), |s| s.to_string_lossy().into_owned()) };
         titles.push(doc.title().map_or(stem.clone(), |t| t[2..].trim().to_string()));
         rows.extend(doc.rows.into_iter().map(|e| Entry { desc: format!("{stem}: {}", e.desc), ..e }));
         if header.is_empty() {
@@ -373,15 +476,40 @@ pub fn combine(files: &[String]) -> Result<Doc, String> {
     }
     rows.sort_by(|a: &Entry, b: &Entry| a.date.cmp(&b.date));
     recalc(&mut rows);
-    Ok(Doc { lines: vec![format!("# {}", titles.join(" + "))], start: 1, end: 1, header, rows })
+    Ok(Doc { source_table: Default::default(), lines: vec![format!("# {}", titles.join(" + "))], start: 1, end: 1, header, rows })
 }
 
 impl Doc {
     pub fn title(&self) -> Option<&str> {
-        self.lines.iter().find(|l| l.starts_with("# ")).map(|l| l.as_str())
+        self.lines.iter().find(|l| l.starts_with("# ") || l.starts_with("## ")).map(|l| l.as_str())
     }
 
     pub fn save(&self, file: &str) -> Result<(), String> {
+        let resolved = resolve(file);
+        let (path, selected) = account_parts(&resolved);
+        if let Some(id) = selected {
+            // Re-read the shared document on every save: cached tabs and transfer
+            // origins must never restore stale sibling tables or prose.
+            let text = fs::read_to_string(path).map_err(|e| format!("{path}: {e}"))?;
+            load(&resolved)?; // reject merge conflicts or a removed/malformed target
+            let raw: Vec<&str> = text.split_inclusive('\n').collect();
+            let lines: Vec<&str> = text.lines().collect();
+            let named = sections(&lines)?;
+            let (_, _, start, end) = named.iter().find(|(name, _, _, _)| name == id)
+                .ok_or_else(|| format!("{file}: no such ledger"))?;
+            let (table_start, table_end, _) = find_table(&lines[*start..*end])?;
+            let current = lines[start + table_start..start + table_end].join("\n");
+            if self.source_table.borrow().as_ref().is_some_and(|previous| previous != &current) {
+                return Err(format!("{file}: ledger changed on disk; reload before saving"));
+            }
+            let rendered = render(&self.header, &self.rows);
+            let mut out = raw[..start + table_start].concat();
+            out += &rendered;
+            out += &raw[start + table_end..].concat();
+            fs::write(path, out).map_err(|e| format!("{path}: {e}"))?;
+            *self.source_table.borrow_mut() = Some(rendered.lines().collect::<Vec<_>>().join("\n"));
+            return Ok(());
+        }
         let mut out = self.lines[..self.start].join("\n");
         if self.start > 0 {
             out += "\n";
@@ -398,10 +526,11 @@ impl Doc {
 pub fn save_commit(file: &str, doc: &Doc, what: &str) -> Result<String, String> {
     doc.save(file)?;
     let dir = Path::new(".");
-    if !git::account_in_tree(dir, file) || !git::autocommit(dir) {
+    let path = account_parts(file).0;
+    if !git::account_in_tree(dir, path) || !git::autocommit(dir) {
         return Ok(String::new());
     }
-    git::commit_push(dir, file, &format!("mdl: {} {what}", file.trim_end_matches(".md")))
+    git::commit_push(dir, path, &format!("mdl: {} {what}", account_name(file)))
 }
 
 /// What to call a commit nobody named.
@@ -582,6 +711,33 @@ pub mod tests {
         let lines: Vec<&str> = text.lines().collect();
         let (s, e, header) = find_table(&lines).unwrap();
         (header, parse_rows(&lines[s + 2..e], s + 3).unwrap())
+    }
+
+    #[test]
+    fn named_saves_preserve_siblings_and_reject_stale_target_changes() {
+        let file = std::env::temp_dir().join(format!("mdl-shared-save-{}.md", std::process::id()));
+        let table = "| Date | Description | Debit | Credit | Balance |\n|---|---|---:|---:|---:|\n| 2026-10-01 | Opening | 100 | | 100 |\n";
+        let text = format!("# USD\n\n## Checking\n\n{table}\n## Savings\n\n{table}\nKeep this footer.\n");
+        fs::write(&file, &text).unwrap();
+        let checking = format!("{}:checking", file.display());
+        let savings = format!("{}:savings", file.display());
+        let mut a = load(&checking).unwrap();
+        let mut b = load(&savings).unwrap();
+        let mut stale = load(&checking).unwrap();
+        add_entry(&mut a.rows, "2026-10-02".into(), 2000, 0, "Deposit".into()).unwrap();
+        a.save(&checking).unwrap();
+        add_entry(&mut b.rows, "2026-10-02".into(), 0, 1000, "Withdrawal".into()).unwrap();
+        b.save(&savings).unwrap();
+        add_entry(&mut a.rows, "2026-10-03".into(), 500, 0, "Another deposit".into()).unwrap();
+        a.save(&checking).unwrap();
+        assert_eq!(balance(&load(&checking).unwrap().rows), 12500);
+        assert_eq!(balance(&load(&savings).unwrap().rows), 9000);
+        assert!(fs::read_to_string(&file).unwrap().ends_with("Keep this footer.\n"));
+        let before = fs::read_to_string(&file).unwrap();
+        add_entry(&mut stale.rows, "2026-10-03".into(), 1, 0, "Stale".into()).unwrap();
+        assert!(stale.save(&checking).unwrap_err().contains("changed on disk"));
+        assert_eq!(fs::read_to_string(&file).unwrap(), before);
+        fs::remove_file(file).unwrap();
     }
 
     #[test]

@@ -33,7 +33,7 @@ fn render_typst(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[S
 
 fn render_typst_accounts(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[String], accounts: &[(String, Doc)]) -> String {
     let name = Path::new(file).file_name().map_or(file.to_string(), |n| n.to_string_lossy().into_owned());
-    let title_line = doc.lines[..doc.start].iter().rposition(|line| line.starts_with("# "));
+    let title_line = doc.lines[..doc.start].iter().rposition(|line| line.starts_with("# ") || (crate::ledger::account_parts(file).1.is_some() && line.starts_with("## ")));
     let title = title_line.map_or(name.as_str(), |i| doc.lines[i][2..].trim());
     let before = render_markdown(&doc.lines[title_line.map_or(0, |i| i + 1)..doc.start]);
     let after = render_markdown(&doc.lines[doc.end..]);
@@ -274,7 +274,9 @@ pub fn print_pdf(doc: &Doc, file: &str, p: &Option<(String, String)>, series: &[
         Some((a, b)) => format!("-{a}-{b}"),
         None => String::new(),
     };
-    let stem = Path::new(file).with_extension("");
+    let (path, section) = crate::ledger::account_parts(file);
+    let stem = Path::new(path).with_extension("");
+    let stem = section.map_or_else(|| stem.clone(), |id| std::path::PathBuf::from(format!("{}-{id}", stem.display())));
     let pdf = match out {
         Some(o) => Path::new(o).to_path_buf(),
         None => Path::new(&format!("{}{suffix}", stem.display())).with_extension("pdf"),
@@ -331,6 +333,22 @@ pub(crate) fn png_from_typst(source: &str) -> Result<Vec<u8>, String> {
 mod tests {
     use super::*;
     use crate::ledger::{load, scoped};
+
+    #[test]
+    fn named_print_includes_only_its_section() {
+        let file = std::env::temp_dir().join(format!("mdl-section-print-{}.md", std::process::id()));
+        let sample = crate::ledger::cash_head(3);
+        let first = sample.replace("# Cash", "## Checking");
+        let second = sample.replace("# Cash", "## Savings");
+        std::fs::write(&file, format!("# USD\nShared preamble.\n{first}\nChecking footer.\n{second}\nSavings footer.")).unwrap();
+        let account = format!("{}:checking", file.display());
+        let output = render_typst(&load(&account).unwrap(), &account, &None, &[]);
+        assert!(output.contains("= #\"Checking\""));
+        assert!(output.contains("Checking footer."));
+        assert!(!output.contains("Savings"));
+        assert!(!output.contains("Shared preamble."));
+        std::fs::remove_file(file).unwrap();
+    }
 
     #[test]
     fn print_typesets_the_statement() {
