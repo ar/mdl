@@ -522,6 +522,7 @@ struct Tui {
     posts: Vec<(String, Entry)>,
     /// Number of newest posts skipped in the history view; None closes it.
     history_scroll: Option<usize>,
+    help: bool,
     /// The search prompt, while open.
     search: Option<String>,
     /// The selection when the search began: where retyping the query searches from.
@@ -581,6 +582,7 @@ impl Tui {
             msg: String::new(),
             posts: vec![],
             history_scroll: None,
+            help: false,
             search: None,
             search_start: None,
             offer_recalc: false,
@@ -717,13 +719,44 @@ impl Tui {
     }
 
     fn draw(&self) -> String {
+        let mut out = self.draw_screen();
+        if self.help {
+            let mut lines = vec!["Keyboard help"];
+            if !self.tabs.is_empty() {
+                lines.extend(["Ctrl-P / Ctrl-N: previous / next tab",
+                    "Ctrl-Left / Ctrl-Right or click: switch tabs",
+                    "Finish or cancel an entry before switching tabs"]);
+            }
+            lines.extend(["Enter: next field / save / edit selected row",
+                "Tab / Shift-Tab: move between fields",
+                "On a row: t transfer, r reverse, n insert",
+                "Space: flag row; Delete: delete selected row",
+                "/: search; Ctrl-H: session history",
+                "Ctrl-L: clear entry; Ctrl-S: sync"]);
+            let width = self.cols.saturating_sub(4).min(70);
+            lines.truncate(self.h.saturating_sub(5));
+            lines.push("? / Esc / Enter: close help");
+            let height = lines.len() + 2;
+            let top = self.h.saturating_sub(height) / 2 + 1;
+            let left = self.cols.saturating_sub(width + 2) / 2 + 1;
+            out += "\x1b[?25l\x1b[0m";
+            out += &format!("\x1b[{top};{left}H┌{}┐", "─".repeat(width));
+            for (i, line) in lines.iter().enumerate() {
+                let text = clipped(line, width);
+                out += &format!("\x1b[{};{left}H│{text:<width$}│", top + i + 1);
+            }
+            out += &format!("\x1b[{};{left}H└{}┘", top + height - 1, "─".repeat(width));
+        }
+        out
+    }
+
+    fn draw_screen(&self) -> String {
         if self.history_scroll.is_some() {
             return self.history_view();
         }
         let mut out = String::from("\x1b[?25l\x1b[H");
         if !self.tabs.is_empty() {
             let strip = self.visible_tabs().into_iter().map(|(_, label)| label).collect::<Vec<_>>().join(" ");
-            let strip = format!("{strip}  · Ctrl-P/N tabs");
             out += &format!("\x1b[2K{}\r\n", clipped(&strip, self.cols));
         }
         let pad = self.view.saturating_sub(self.lines.len());
@@ -1824,7 +1857,7 @@ impl Tui {
     /// Keep the active tab visible even with many ledgers or long titles.
     fn visible_tabs(&self) -> Vec<(usize, String)> {
         let active = self.account.as_ref().and_then(|(p, _)| self.tabs.iter().position(|(id, _)| id == p)).unwrap_or(0);
-        let room = self.cols.saturating_sub(20).max(8);
+        let room = self.cols.max(8);
         let labels: Vec<String> = self.tabs.iter().enumerate().map(|(i, (_, title))| {
             let title = clipped(title, room.saturating_sub(2));
             if i == active { format!("[{title}]") } else { format!(" {title} ") }
@@ -1866,6 +1899,16 @@ impl Tui {
 
     fn handle(&mut self, key: Key) -> bool {
         if key == Key::Idle {
+            return true;
+        }
+        if self.help {
+            if matches!(key, Key::Char('?') | Key::Esc | Key::Enter) { self.help = false; }
+            return true;
+        }
+        // Keep question marks available inside descriptions and search text.
+        if key == Key::Char('?') && self.drag.is_none() && self.search.is_none()
+            && !self.edit_form() && (self.history_scroll.is_some() || self.sel.is_some() || self.fields[self.focus].is_empty()) {
+            self.help = true;
             return true;
         }
         if self.history_scroll.is_some() {
@@ -2173,6 +2216,28 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn help_is_modal_and_tab_shortcuts_are_not_on_the_regular_screen() {
+        let mut t = Tui::new();
+        t.in_repo = false;
+        t.resize(24, 100);
+        t.tabs = vec![("usd.md:checking".into(), "Checking".into()), ("usd.md:savings".into(), "Savings".into())];
+        let normal = t.draw();
+        assert!(!normal.contains("Ctrl-P"));
+        let fields = t.fields.clone();
+        t.handle(Key::Char('?'));
+        assert!(t.draw().contains("Ctrl-P / Ctrl-N"));
+        t.handle(Key::Char('x'));
+        assert_eq!(t.fields, fields);
+        t.handle(Key::Esc);
+        assert_eq!(t.draw(), normal);
+        t.focus = 1;
+        t.fields[1] = "Question".into();
+        t.handle(Key::Char('?'));
+        assert!(!t.help);
+        assert_eq!(t.fields[1], "Question?");
     }
 
     #[test]

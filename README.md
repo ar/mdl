@@ -73,7 +73,8 @@ Once a document uses named ledger sections, CLI reads and writes require a
 qualified name, even if it currently contains only one named ledger. A bare
 `mdl edit usd` or selecting `usd` in the interactive account picker opens the
 first tab. Switch tabs with **Ctrl-P / Ctrl-N**, **Ctrl-Left / Ctrl-Right**, or a
-mouse click. Selection and scrolling are remembered per tab. Finish or cancel
+mouse click. Press `?` on a selected row or in an empty entry field for popup
+help; Esc, Enter, or `?` closes it. Selection and scrolling are remembered per tab. Finish or cancel
 an unfinished entry before switching; Ctrl-L clears the entry. An explicit edit
 session stays within that document, with transfers still able to use other accounts.
 
