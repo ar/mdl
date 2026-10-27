@@ -42,7 +42,8 @@ usage: mdl [<file>[.md][:ledger]] [<command> [args...]]
 
   Named ledgers: ## Checking in usd.md is usd:checking (or usd.md:checking).
   Use lowercase heading words joined by hyphens: Emergency Fund -> emergency-fund.
-  CLI operations on named sections require file:ledger.
+  A bare document shows, checks, recalculates, or reports all its ledgers.
+  Entry changes require file:ledger; balances stay independent.
   mdl init usd:checking Checking        append a named ledger (or create its file)
   mdl edit usd                         open the document with ledger tabs
   mdl edit usd:checking                open with Checking selected
@@ -423,7 +424,8 @@ fn cmd_balance(initial_files: &[String], args: &[String]) -> Result<(), String> 
         print!("{}", account_chart::render(&chart, as_of, format.unwrap_or("pretty"), only_total, io::stdout().is_terminal()));
         return Ok(());
     }
-    let accounts = files.iter().map(|f| Ok((f.clone(), account_chart::account_balance(f, as_of)?)))
+    let files = ledger::expand_accounts(&files)?;
+    let accounts = files.iter().map(|f| Ok((if ledger::account_parts(f).1.is_some() { ledger::account_name(f) } else { f.clone() }, account_chart::account_balance(f, as_of)?)))
         .collect::<Result<Vec<_>, String>>()?;
     print!("{}", render::render_balances(&accounts, format.unwrap_or("pretty"), only_total, io::stdout().is_terminal()));
     Ok(())
@@ -492,6 +494,108 @@ fn chart_accounts(files: &[String], p: &Option<(String, String)>) -> Result<Vec<
     }).collect()
 }
 
+/// Display document children independently; explicit account lists retain combined statements.
+fn cmd_show(files: &[String], rest: &[String], separate: bool) -> Result<(), String> {
+    let graph = rest.iter().any(|a| a == "--graph");
+    let series: Vec<String> = if graph { rest.iter().filter(|a| ["balance", "debit", "credit"].contains(&a.as_str())).cloned().collect() } else { vec![] };
+    let json = rest.iter().any(|a| a == "--json");
+    let csv = rest.iter().any(|a| a == "--csv");
+    let markdown = rest.iter().any(|a| a == "--markdown");
+    let explicit_pretty = rest.iter().any(|a| a == "--pretty");
+    if json as u8 + csv as u8 + markdown as u8 + explicit_pretty as u8 > 1 {
+        bad("show: choose only one of --pretty, --markdown, --json, or --csv");
+    }
+    if graph && (json || csv || markdown) {
+        bad("show: --graph requires the default or --pretty output");
+    }
+    let pretty = !json && !csv && !markdown;
+    let words: Vec<String> = rest.iter().filter(|a| {
+        !["--json", "--csv", "--pretty", "--markdown"].contains(&a.as_str())
+            && !(graph && ["--graph", "balance", "debit", "credit"].contains(&a.as_str()))
+    }).cloned().collect();
+    let p = period(&words, &today())?;
+    // Parse all ledgers before producing output, including structured exports.
+    let docs = if separate {
+        files.iter().map(|f| load(f).map(|d| scoped(d, &p))).collect::<Result<Vec<_>, _>>()?
+    } else {
+        vec![scoped(if files.len() == 1 { load(&files[0])? } else { ledger::combine(files)? }, &p)]
+    };
+    if separate && json { print!("{{\"accounts\":["); }
+    for (index, doc) in docs.into_iter().enumerate() {
+        let file = &files[index];
+        if json {
+            let title = if separate { Some(ledger::account_name(file)) } else { doc.title().map(|t| t[2..].trim().to_string()) };
+            if separate && index > 0 { print!(","); }
+            print!("{}", render_json(title.as_deref(), &doc.rows));
+        } else if csv {
+            let output = render_csv(&doc.header, &doc.rows);
+            if separate {
+                if index == 0 { println!("Account,{}", output.lines().next().unwrap_or_default()); }
+                let name = render::csv_str(&ledger::account_name(file));
+                for line in output.lines().skip(1) { println!("{name},{line}"); }
+            } else { print!("{output}"); }
+        } else {
+            if separate {
+                if index > 0 { println!(); }
+                let name = ledger::account_name(file);
+                println!("{}{name}\n", if pretty { "" } else { "## " });
+            } else if let Some(t) = doc.title() {
+                println!("{}\n", if pretty { t[2..].trim() } else { t });
+            }
+            print!("{}", if pretty {
+                render_pretty(&doc.header, &doc.rows, io::stdout().is_terminal())
+            } else {
+                render(&doc.header, &doc.rows)
+            });
+        }
+        if graph && chart::supported() {
+            let series = if series.is_empty() { vec!["balance".to_string()] } else { series.clone() };
+            let accounts = if separate { vec![] } else { chart_accounts(files, &p)? };
+            let png = if accounts.is_empty() { graph_png(&doc, &p, &series)? } else { graph_png_accounts(&doc, &p, &series, &accounts)? };
+            if let Some(png) = png {
+                chart::display(&png).map_err(|e| format!("graph: {e}"))?;
+            }
+        }
+    }
+    if separate && json { println!("]}}"); }
+    Ok(())
+}
+
+/// Lint every account, or recalculate each ledger independently after parsing all targets.
+fn cmd_check(files: &[String], cmd: &str, rest: &[String]) -> Result<(), String> {
+    if (cmd == "lint" && !rest.is_empty()) || (cmd == "recalc" && !rest.is_empty() && rest != ["--dry-run"]) {
+        return Err(format!("{cmd}: unexpected arguments"));
+    }
+    let mut docs = Vec::new();
+    let mut errors = Vec::new();
+    for file in files {
+        match load(file) {
+            Ok(doc) => {
+                let issues = if cmd == "lint" { lint(&doc.rows) }
+                    else if !rest.is_empty() { recalc_diff(&doc.rows) } else { vec![] };
+                errors.extend(issues.into_iter().map(|e| format!("{}: {e}", ledger::account_name(file))));
+                docs.push((file, doc));
+            }
+            Err(e) => errors.push(e),
+        }
+    }
+    if !errors.is_empty() { return Err(errors.join("\n")); }
+    if cmd == "lint" || !rest.is_empty() { return Ok(()); }
+    for (file, doc) in &mut docs {
+        recalc(&mut doc.rows);
+        doc.save(file)?;
+    }
+    let mut saved = std::collections::HashSet::new();
+    for (file, _) in docs {
+        let path = ledger::account_parts(file).0;
+        if saved.insert(path) && git::account_in_tree(Path::new("."), path) && git::autocommit(Path::new(".")) {
+            let note = git::commit_push(Path::new("."), path, &format!("mdl: {} recalc", ledger::account_name(path)))?;
+            if note != "pushed" { eprintln!("{note}"); }
+        }
+    }
+    Ok(())
+}
+
 fn run() -> Result<(), String> {
     let args: Vec<String> = env::args().skip(1).collect();
     if args.is_empty() {
@@ -546,6 +650,27 @@ fn run() -> Result<(), String> {
     if cmd == "balance" {
         return cmd_balance(&files, rest);
     }
+    if cmd == "edit" && rest.is_empty() && files.len() == 1 { return cmd_edit(&files[0]); }
+    let expanded = ledger::expand_accounts(&files)?;
+    let document = expanded != files;
+    if cmd == "show" { return cmd_show(&expanded, rest, document); }
+    if cmd == "lint" || cmd == "recalc" { return cmd_check(&expanded, cmd, rest); }
+    if document && (cmd == "print" || cmd == "graph") {
+        if expanded.len() > 1 && rest.iter().any(|a| a == "-o") {
+            return Err(format!("{cmd}: select a specific account when using -o with a multi-ledger document"));
+        }
+        // Validate all targets before creating any output files.
+        for file in &expanded { load(file)?; }
+        for file in &expanded { run_command(std::slice::from_ref(file), cmd, rest)?; }
+        return Ok(());
+    }
+    if document {
+        return Err(format!("{cmd}: select a specific account: {}", expanded.iter().map(|f| ledger::account_name(f)).collect::<Vec<_>>().join(", ")));
+    }
+    run_command(&files, cmd, rest)
+}
+
+fn run_command(files: &[String], cmd: &str, rest: &[String]) -> Result<(), String> {
     let combined;
     let file = if files.len() == 1 {
         &files[0]
@@ -567,55 +692,7 @@ fn run() -> Result<(), String> {
     let mut doc = if files.len() == 1 { load(file)? } else { ledger::combine(&files)? };
     let what: String;
 
-    match cmd.as_str() {
-        "lint" => {
-            let errs = lint(&doc.rows);
-            return if errs.is_empty() { Ok(()) } else { Err(errs.join("\n")) };
-        }
-        "show" => {
-            let graph = rest.iter().any(|a| a == "--graph");
-            let series: Vec<String> = if graph { rest.iter().filter(|a| ["balance", "debit", "credit"].contains(&a.as_str())).cloned().collect() } else { vec![] };
-            let json = rest.iter().any(|a| a == "--json");
-            let csv = rest.iter().any(|a| a == "--csv");
-            let markdown = rest.iter().any(|a| a == "--markdown");
-            let explicit_pretty = rest.iter().any(|a| a == "--pretty");
-            if json as u8 + csv as u8 + markdown as u8 + explicit_pretty as u8 > 1 {
-                bad("show: choose only one of --pretty, --markdown, --json, or --csv");
-            }
-            if graph && (json || csv || markdown) {
-                bad("show: --graph requires the default or --pretty output");
-            }
-            let pretty = !json && !csv && !markdown;
-            let words: Vec<String> = rest.iter().filter(|a| {
-                !["--json", "--csv", "--pretty", "--markdown"].contains(&a.as_str())
-                    && !(graph && ["--graph", "balance", "debit", "credit"].contains(&a.as_str()))
-            }).cloned().collect();
-            let p = period(&words, &today())?;
-            let doc = scoped(doc, &p);
-            if json {
-                print!("{}", render_json(doc.title().map(|t| t[2..].trim()), &doc.rows));
-            } else if csv {
-                print!("{}", render_csv(&doc.header, &doc.rows));
-            } else {
-                if let Some(t) = doc.title() {
-                    println!("{}\n", if pretty { t[2..].trim() } else { t });
-                }
-                print!("{}", if pretty {
-                    render_pretty(&doc.header, &doc.rows, io::stdout().is_terminal())
-                } else {
-                    render(&doc.header, &doc.rows)
-                });
-            }
-            if graph && chart::supported() {
-                let series = if series.is_empty() { vec!["balance".to_string()] } else { series };
-                let accounts = chart_accounts(&files, &p)?;
-                let png = if accounts.is_empty() { graph_png(&doc, &p, &series)? } else { graph_png_accounts(&doc, &p, &series, &accounts)? };
-                if let Some(png) = png {
-                    chart::display(&png).map_err(|e| format!("graph: {e}"))?;
-                }
-            }
-            return Ok(());
-        }
+    match cmd {
         "graph" => {
             let mut rest = rest.to_vec();
             let out = match rest.iter().position(|w| w == "-o") {
@@ -667,23 +744,12 @@ fn run() -> Result<(), String> {
             println!("{}", print_pdf(&doc, file, &p, &series, &accounts, out.as_deref())?);
             return Ok(());
         }
-        "recalc" => match rest {
-            [] => {
-                recalc(&mut doc.rows);
-                what = "recalc".into();
-            }
-            [d] if d == "--dry-run" => {
-                let diffs = recalc_diff(&doc.rows);
-                return if diffs.is_empty() { Ok(()) } else { Err(diffs.join("\n")) };
-            }
-            _ => bad("recalc takes --dry-run and nothing else"),
-        },
         "debit" | "credit" | "note" => {
             let (date, rest) = match rest {
                 [f, d, r @ ..] if f == "--date" => (d.clone(), r),
                 _ => (today(), rest),
             };
-            let (debit, credit, desc) = match (cmd.as_str(), rest) {
+            let (debit, credit, desc) = match (cmd, rest) {
                 ("note", desc) => (0, 0, desc),
                 ("debit", [amount, desc @ ..]) => (amount_arg(amount)?, 0, desc),
                 ("credit", [amount, desc @ ..]) => (0, amount_arg(amount)?, desc),

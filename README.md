@@ -69,10 +69,25 @@ creates a missing ledger. To extend an existing ordinary account, first add a
 `##` heading above its existing table; the existing `#` document title may stay.
 Existing unnamed single-account documents keep their original commands.
 
-Once a document uses named ledger sections, CLI reads and writes require a
-qualified name, even if it currently contains only one named ledger. A bare
-`mdl edit usd` or selecting `usd` in the interactive account picker opens the
-first tab. Switch tabs with **Ctrl-P / Ctrl-N**, **Ctrl-Left / Ctrl-Right**, or a
+A bare document name operates on all its ledgers: `mdl usd` (or `mdl usd show`)
+shows separate statements labelled `usd:checking` and `usd:emergency-fund`, with
+independent running balances. `mdl usd lint`, `mdl usd recalc`, and
+`mdl usd recalc --dry-run` visit every ledger; errors identify the affected
+account. Recalculation parses all targets before changing any table.
+`mdl usd balance` and `mdl balance usd` report each ledger and the usual total;
+no currency conversion is performed. Repeated named-ledger references count only once.
+
+Document-wide `show --json` returns an `accounts` array of statements with qualified
+names in their `title` fields. `show --csv` adds an `Account` column and uses the
+first ledger's column labels. Period filters apply independently to each ledger.
+Explicit lists such as `mdl usd:checking usd:emergency-fund show` retain the
+combined-statement behavior.
+
+`mdl usd print` creates one PDF per ledger; `mdl usd graph` graphs each ledger
+separately. Select a specific ledger when supplying `-o` for a multi-ledger file.
+Entry-changing commands (`debit`, `credit`, `note`, row `edit`, `move`, `flag`, and
+`delete`) still require a qualified account. A bare `mdl edit usd` or selecting
+`usd` in the interactive account picker opens the first tab. Switch tabs with **Ctrl-P / Ctrl-N**, **Ctrl-Left / Ctrl-Right**, or a
 mouse click. Press `?` on a selected row or in an empty entry field for popup
 help; Esc, Enter, or `?` closes it. Selection and scrolling are remembered per tab. Finish or cancel
 an unfinished entry before switching; Ctrl-L clears the entry. An explicit edit

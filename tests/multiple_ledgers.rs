@@ -47,7 +47,7 @@ fn qualified_cli_edits_preserve_siblings_and_support_reports() {
     f.ok(&["usd:emergency-fund", "lint"]);
     assert_eq!(f.ok(&["balance", "usd:checking", "usd:emergency-fund", "-q"]), "130.00\n100.00\n230.00\n");
     let bare = f.run(&["usd", "credit", "20", "Ambiguous"]);
-    assert!(String::from_utf8_lossy(&bare.stderr).contains("select a ledger"));
+    assert!(String::from_utf8_lossy(&bare.stderr).contains("select a specific account"));
     fs::write(f.0.join("chart.md"), "- USD\n  - [Checking](usd:checking)\n  - [Savings](usd.md:emergency-fund)\n").unwrap();
     assert_eq!(f.ok(&["balance", "--total", "-q"]), "230.00\n");
     assert!(f.ok(&["graph", "2026-10", "--monthly"]).contains("230.00"));
@@ -103,8 +103,80 @@ fn malformed_sections_and_fenced_examples() {
 fn qualified_print_has_a_distinct_filename() {
     if Command::new("typst").arg("--version").output().is_err() { return; }
     let f = Fixture::new("print");
-    let text = document().replace("Checking notes.", "").replace("Checking footer.", "");
+    let text = document().replace("Checking notes.", "").replace("Checking footer.", "")
+        .replace("Savings notes.", "").replace("Savings footer.", "");
     fs::write(f.0.join("usd.md"), text).unwrap();
     f.ok(&["usd:checking", "print"]);
     assert!(Path::new(&f.0.join("usd-checking.pdf")).exists());
+    f.ok(&["usd", "print"]);
+    assert!(f.0.join("usd-emergency-fund.pdf").exists());
+    assert!(!f.run(&["usd", "print", "-o", "all.pdf"]).status.success());
+    assert!(!f.0.join("all.pdf").exists());
+}
+
+#[test]
+fn bare_documents_show_and_balance_every_ledger_without_merging_statements() {
+    let f = Fixture::new("all-show");
+    fs::write(f.0.join("usd.md"), document()).unwrap();
+    let shown = f.ok(&["usd"]);
+    assert!(shown.contains("usd:checking\n"));
+    assert!(shown.contains("usd:emergency-fund\n"));
+    assert!(shown.find("usd:checking").unwrap() < shown.find("usd:emergency-fund").unwrap());
+    assert!(!shown.contains("200.00"), "individual statements must not acquire a combined running balance");
+    assert_eq!(shown, f.ok(&["usd.md", "show"]));
+    let markdown = f.ok(&["usd", "show", "2026-10", "--markdown"]);
+    assert!(markdown.contains("## usd:checking"));
+    assert!(markdown.contains("## usd:emergency-fund"));
+    let json = f.ok(&["usd", "--json"]);
+    assert!(json.starts_with("{\"accounts\":["));
+    assert_eq!(json.matches("\"title\"").count(), 2);
+    assert!(json.contains("\"title\": \"usd:checking\""));
+    assert!(json.contains("\"title\": \"usd:emergency-fund\""));
+    assert!(json.trim_end().ends_with("]}"));
+    let csv = f.ok(&["usd", "--csv"]);
+    assert_eq!(csv.lines().count(), 3);
+    assert!(csv.starts_with("Account,Date,Description,Debit,Credit,Balance\n"));
+    assert!(csv.contains("usd:checking,2026-10-01,Opening,100.00,0.00,100.00"));
+    assert!(csv.contains("usd:emergency-fund,2026-10-01,Opening,100.00,0.00,100.00"));
+    for args in [&["usd", "balance", "-q"][..], &["balance", "usd.md", "-q"], &["balance", "usd", "usd:checking", "-q"]] {
+        assert_eq!(f.ok(args), "100.00\n100.00\n200.00\n");
+    }
+    assert_eq!(f.ok(&["balance", "usd", "--as-of", "2026-09-30", "-q"]), "0.00\n0.00\n0.00\n");
+    let balance = f.ok(&["usd", "balance", "--json"]);
+    assert!(balance.contains("\"account\": \"usd:checking\""));
+    assert!(balance.contains("\"account\": \"usd:emergency-fund\""));
+    let selected = f.ok(&["usd:checking", "show"]);
+    assert!(!selected.contains("Emergency"));
+}
+
+#[test]
+fn document_lint_and_recalc_visit_all_ledgers_and_validate_before_writing() {
+    let f = Fixture::new("all-recalc");
+    let stale = document().replace("| 100 | | 100 |", "| 100 | | 999 |");
+    fs::write(f.0.join("usd.md"), &stale).unwrap();
+    for args in [&["usd", "lint"][..], &["usd", "recalc", "--dry-run"]] {
+        let out = f.run(args);
+        assert!(!out.status.success());
+        let errors = String::from_utf8_lossy(&out.stderr);
+        assert!(errors.contains("usd:checking:"));
+        assert!(errors.contains("usd:emergency-fund:"));
+        assert_eq!(fs::read_to_string(f.0.join("usd.md")).unwrap(), stale);
+    }
+    let (before, after) = stale.split_once("## Emergency Fund").unwrap();
+    let broken = format!("{before}## Emergency Fund{}", after.replace("2026-10-01", "invalid-date"));
+    fs::write(f.0.join("usd.md"), &broken).unwrap();
+    assert!(!f.run(&["usd", "recalc"]).status.success());
+    assert_eq!(fs::read_to_string(f.0.join("usd.md")).unwrap(), broken);
+    let out = f.run(&["usd", "show"]);
+    assert!(!out.status.success());
+    assert!(out.stdout.is_empty());
+    fs::write(f.0.join("usd.md"), &stale).unwrap();
+    f.ok(&["usd", "recalc"]);
+    f.ok(&["usd", "lint"]);
+    f.ok(&["usd", "recalc", "--dry-run"]);
+    assert_eq!(f.ok(&["usd", "balance", "-q"]), "100.00\n100.00\n200.00\n");
+    let saved = fs::read_to_string(f.0.join("usd.md")).unwrap();
+    assert!(saved.contains("Shared notes."));
+    assert!(saved.contains("Checking footer."));
+    assert!(saved.contains("Savings footer."));
 }

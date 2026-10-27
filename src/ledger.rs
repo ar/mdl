@@ -415,6 +415,30 @@ pub fn ledger_tabs(account: &str) -> Result<Vec<(String, String)>, String> {
         .map(|(id, title, _, _)| (format!("{file}:{id}"), title)).collect())
 }
 
+/// Expand document references in section order, retaining explicit account selections.
+pub fn expand_accounts(files: &[String]) -> Result<Vec<String>, String> {
+    let mut accounts = Vec::new();
+    for file in files {
+        let resolved = resolve(file);
+        if account_parts(&resolved).1.is_some() {
+            accounts.push(resolved);
+        } else {
+            let tabs = ledger_tabs(&resolved)?;
+            if tabs.is_empty() { accounts.push(resolved); }
+            else { accounts.extend(tabs.into_iter().map(|(id, _)| id)); }
+        }
+    }
+    // Repeated documents or explicit children must not be counted/recalculated twice.
+    let mut seen = std::collections::HashSet::new();
+    accounts.retain(|account| {
+        let (path, id) = account_parts(account);
+        if id.is_none() { return true; } // Preserve legacy explicit file-list semantics.
+        let path = fs::canonicalize(path).unwrap_or_else(|_| Path::new(path).to_path_buf());
+        seen.insert((path, id.map(str::to_string)))
+    });
+    Ok(accounts)
+}
+
 /// A real ledger must parse and contain an entry; generic headers and fenced
 /// examples alone do not opt a document into automatic Git management.
 pub fn contains_ledger(file: &str) -> bool {
