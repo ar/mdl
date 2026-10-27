@@ -326,6 +326,41 @@ save directly without fetching, committing, or syncing on exit. Git scope and
 autocommit settings are checked when an account opens, not on each keystroke or
 local save.
 
+## Conservative Git management
+
+MDL only commits modified files that already exist in the current commit (`HEAD`)
+and contain at least one parseable ledger table with an entry. Fenced examples,
+ordinary prose, generic tables, and malformed ledgers do not qualify. Stale
+balances do qualify, so you can commit changes before running `recalc`.
+
+New files, including staged additions, need their first **manual Git commit**.
+`mdl init` and edits to an untracked account still save locally. Deletions, renames,
+symlinks, and files with both staged and unstaged changes are left alone.
+Files with only staged changes can qualify; files with partial staging are skipped.
+MDL commits only eligible paths and preserves unrelated staged changes, including
+those outside the current account directory. It refuses Git writes during a merge,
+rebase, cherry-pick, or revert in progress.
+
+These rules apply to save-time commits, account-picker exit, Ctrl-S, `mdl push`,
+and `mdl sync`. They select whole files: prose edits within an eligible ledger
+file are included in its commit. Chart documents without ledger tables must be
+committed manually.
+
+```sh
+git config mdl.autocommit true  # commit eligible account changes on save
+git config mdl.autopush true    # opt into automatic pushes on save and TUI exit
+```
+
+Automatic pushing is **off by default**, independently of `mdl.autocommit`.
+Leaving the account picker still commits eligible changes locally. Explicit
+`mdl push`, `mdl sync`, and Ctrl-S push without requiring `mdl.autopush`.
+A push sends all pending commits on the branch, including manual commits.
+Explicit `mdl edit` sessions continue to exit without syncing.
+
+All MDL pulls are fast-forward-only. If local and upstream histories diverge,
+MDL reports it and leaves reconciliation to a manual merge or rebase. It never
+creates an automatic merge commit or inserts merge-conflict markers.
+
 ## New accounts
 
 `mdl init <file[.md]> [--lang es|en] [title...]` writes the file with a heading, a line

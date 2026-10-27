@@ -12,7 +12,8 @@
 //!
 //! Git: `fetch`, `push` and `sync` work on the current directory (the account tree),
 //! scoped to it. With `git config mdl.autocommit true` in that repository every
-//! save also commits the file and pushes best-effort. The account picker fetches
+//! save commits eligible tracked ledgers; `mdl.autopush` separately enables pushes.
+//! The account picker fetches
 //! on the way in and syncs on the way out; `edit` opens locally and leaves locally.
 //! See git.rs and tui.rs.
 #[cfg(test)]
@@ -94,10 +95,13 @@ Write
 
 Git (the current directory is the account tree)
   mdl fetch                            bring the tree up to date; no commit
-  mdl push [message...]                commit everything pending and push
+  mdl push [message...]                commit eligible tracked ledgers and push
   mdl sync [message...]                fetch, then push
-  git config mdl.autocommit true       every save commits and pushes
-  (leaving the account picker syncs whatever is pending)
+  git config mdl.autocommit true       commit eligible ledgers on save
+  git config mdl.autopush true         also push automatically (default: off)
+  (exit commits eligible ledgers; push requires mdl.autopush)
+  New files need a manual first commit. Non-ledgers, deletions, renames, and
+  partially staged files are skipped. Pulls only fast-forward.
 
 period      YYYY-MM [YYYY-MM] | this [N] | last [N]: months; this N ends with
             the current month, last N with the previous one; the statement
@@ -137,7 +141,7 @@ fn bad(what: &str) -> ! {
 /// `mdl init <file[.md]> [--lang es|en] [title...]`: a new account from the template,
 /// titled after the file when no title is given. An existing file keeps everything it
 /// has and gets the table appended (the title is then not used); one that already has
-/// a table is refused. With `mdl.autocommit`, commits and pushes it like any other save.
+/// a table is refused. Git eligibility and automatic push settings apply to saves.
 fn cmd_init(args: &[String]) -> Result<(), String> {
     let mut lang = "en".to_string();
     let mut words = vec![];
@@ -351,7 +355,7 @@ fn cmd_fetch() -> Result<(), String> {
     Ok(())
 }
 
-/// `mdl push [message...]`: commit everything pending under the tree and push it.
+/// `mdl push [message...]`: commit eligible ledger changes under the tree and push.
 /// Fails when the push itself fails: an explicit push that did not push is an error.
 fn cmd_push(msg: &[String]) -> Result<(), String> {
     let dir = repo_dir()?;
@@ -824,7 +828,7 @@ mod tests {
         fs::remove_dir_all(&dir).unwrap();
     }
 
-    /// Two clones of a bare remote: push, fast-forward, merge, conflict.
+    /// Two clones of a bare remote: explicit enrollment, push, fast-forward, divergence.
     #[test]
     fn git_round_trip() {
         use std::process::Command;
@@ -850,9 +854,11 @@ mod tests {
 
         let table = "# Caja\n\n| Fecha | Descripción | Debe | Haber | Saldo |\n|---|---|--:|--:|--:|\n| 2026-09-01 | inicial | 1.00 | | 1.00 |\n";
         fs::write(a.join("caja.md"), table).unwrap();
-        assert_eq!(git::pending(&a).unwrap(), ["caja.md"]);
+        assert!(git::pending(&a).unwrap().is_empty());
+        sh(&a, &["add", "caja.md"]);
+        sh(&a, &["commit", "--quiet", "-m", "Enroll caja"]);
         let (_, note) = push_pending(&a, "").unwrap();
-        assert_eq!(note, "committed: mdl: update caja; pushed"); // first push creates the upstream
+        assert_eq!(note, "pushed"); // first push creates the upstream
         assert_eq!(git::sync(&a).unwrap(), git::State::UpToDate);
 
         clone(&b);
@@ -861,24 +867,28 @@ mod tests {
         assert_eq!(git::pull(&b).unwrap(), (true, "fast-forwarded to the upstream"));
         assert!(fs::read_to_string(b.join("caja.md")).unwrap().contains("| a |"));
 
-        // divergence on different files merges; stale balances are what recalc is for
+        // Divergence on different files requires a manual merge.
         fs::write(a.join("banco.md"), table).unwrap();
+        sh(&a, &["add", "banco.md"]);
+        sh(&a, &["commit", "--quiet", "-m", "Enroll banco"]);
         push_pending(&a, "").unwrap();
         fs::write(b.join("caja.md"), format!("{table}| 2026-09-02 | a | 1.00 | | 2.00 |\n| 2026-09-03 | b | | 0.50 | 1.50 |\n")).unwrap();
         assert!(git::commit_all(&b, "from b").unwrap());
         assert_eq!(git::sync(&b).unwrap(), git::State::Diverged);
-        assert_eq!(git::pull(&b).unwrap(), (true, "merged the upstream"));
+        assert!(git::pull(&b).unwrap_err().contains("diverged"));
+        assert!(!b.join("banco.md").exists());
+        sh(&b, &["merge", "--no-edit", "@{u}"]);
         assert!(b.join("banco.md").exists());
         assert_eq!(git::push(&b), "pushed");
 
-        // divergence at the same tail conflicts, and says so
+        // Divergence at the same tail also leaves the working tree untouched.
         fs::write(a.join("caja.md"), format!("{table}| 2026-09-02 | a | 1.00 | | 2.00 |\n| 2026-09-04 | x | 1.00 | | 3.00 |\n")).unwrap();
         assert!(git::commit_all(&a, "a again").unwrap());
         assert_eq!(git::sync(&a).unwrap(), git::State::Diverged);
         let err = git::pull(&a).unwrap_err();
-        assert!(err.starts_with("merge conflicts;") && err.ends_with("caja.md"), "{err}");
-        assert!(load(a.join("caja.md").to_str().unwrap()).is_err()); // markers trip the parser
-        sh(&a, &["merge", "--abort"]);
+        assert!(err.contains("diverged"), "{err}");
+        assert!(load(a.join("caja.md").to_str().unwrap()).is_ok());
+        assert!(!a.join(".git/MERGE_HEAD").exists());
         assert!(!git::autocommit(&a));
         sh(&a, &["config", "mdl.autocommit", "true"]);
         assert!(git::autocommit(&a));

@@ -415,6 +415,14 @@ pub fn ledger_tabs(account: &str) -> Result<Vec<(String, String)>, String> {
         .map(|(id, title, _, _)| (format!("{file}:{id}"), title)).collect())
 }
 
+/// A real ledger must parse and contain an entry; generic headers and fenced
+/// examples alone do not opt a document into automatic Git management.
+pub fn contains_ledger(file: &str) -> bool {
+    let Ok(tabs) = ledger_tabs(file) else { return false };
+    if tabs.is_empty() { return load(file).is_ok_and(|d| !d.rows.is_empty()); }
+    tabs.iter().any(|(account, _)| load(account).is_ok_and(|d| !d.rows.is_empty()))
+}
+
 /// TUI document opening selects the first tab; CLI reads require a section name.
 pub fn first_account(account: &str) -> Result<String, String> {
     if account_parts(account).1.is_some() { return Ok(resolve(account)); }
@@ -521,8 +529,8 @@ impl Doc {
     }
 }
 
-/// Save; with `mdl.autocommit` set in the repository, also commit the file and push
-/// best-effort. Returns git's note, or "" when git is not involved.
+/// Save; with `mdl.autocommit`, commit an eligible tracked ledger. Push only with
+/// `mdl.autopush`. Returns git's note, or "" when git is not involved.
 pub fn save_commit(file: &str, doc: &Doc, what: &str) -> Result<String, String> {
     doc.save(file)?;
     let dir = Path::new(".");
@@ -545,11 +553,16 @@ pub fn default_commit_message(paths: &[String]) -> String {
     }
 }
 
-/// Commit whatever is pending under `dir` (with `msg`, or a generated one) and push.
+/// Commit eligible ledger changes under `dir` and explicitly push.
 /// Returns the pending paths and a note; the note contains "push failed" when it did.
 pub fn push_pending(dir: &Path, msg: &str) -> Result<(Vec<String>, String), String> {
+    sync_pending(dir, msg, true)
+}
+
+/// Shared commit policy; automatic callers must explicitly opt into pushing.
+pub fn sync_pending(dir: &Path, msg: &str, push: bool) -> Result<(Vec<String>, String), String> {
     let pending = git::pending(dir)?;
-    if pending.is_empty() && git::has_upstream(dir) && git::unpushed(dir) == 0 {
+    if push && pending.is_empty() && git::has_upstream(dir) && git::unpushed(dir) == 0 {
         return Ok((pending, "nothing to push".into()));
     }
     let mut note = String::new();
@@ -559,7 +572,7 @@ pub fn push_pending(dir: &Path, msg: &str) -> Result<(Vec<String>, String), Stri
             note = format!("committed: {msg}; ");
         }
     }
-    note += &git::push(dir);
+    note += &if push { git::push(dir) } else { "automatic push disabled".into() };
     Ok((pending, note))
 }
 

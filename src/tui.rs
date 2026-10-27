@@ -7,7 +7,9 @@ use std::time::{Duration, Instant};
 use std::{fs, process};
 
 use crate::git;
-use crate::ledger::{Doc, Entry, add_entry, delete_entry, amount_arg, edit_entry, edited_position, entry_what, fmt_amount, fmt_col, insert_entry, load, move_entry, parse_amount, push_pending, recalc, recalc_diff, today};
+#[cfg(test)]
+use crate::ledger::push_pending;
+use crate::ledger::{Doc, Entry, add_entry, delete_entry, amount_arg, edit_entry, edited_position, entry_what, fmt_amount, fmt_col, insert_entry, load, move_entry, parse_amount, recalc, recalc_diff, today};
 use crate::render::{grid, natural_widths, render_lines, totals};
 
 fn stty(args: &[&str]) -> Option<String> {
@@ -395,6 +397,8 @@ impl GitStatus {
         if note.contains("push failed") { Self::Pending }
         else if note.contains("fetch failed") { Self::Offline }
         else if note.contains("no remote") { Self::Local }
+        else if note.contains("automatic push disabled") { Self::Pending }
+        else if note.contains("saved locally") { Self::Local }
         else if full_sync { Self::Synced }
         else if note.contains("no upstream") { Self::Local }
         else if note.contains("not yet pushed") { Self::Pending }
@@ -466,8 +470,8 @@ impl GitStatus {
 // Git: the account picker starts a fetch in the background (unless fetched within
 // 15 minutes), and opening an account waits for it. A fixed account opens from disk
 // without fetching or syncing on exit. Ctrl-S fetches + commits + pushes in either
-// screen, and with `mdl.autocommit` every save does. Leaving the account picker
-// syncs when anything is pending or unpushed; a clean, pushed tree leaves at once.
+// screen. With `mdl.autocommit`, saves commit eligible ledgers. Automatic pushes
+// on save or account-picker exit require `mdl.autopush`.
 /// A counterpart is a new entry; the source is retained for cancellation and return.
 struct Counterpart {
     source: String,
@@ -1698,14 +1702,14 @@ impl Tui {
             self.msg = e;
             return;
         }
-        let result = self.sync_job();
+        let result = self.sync_job(true);
         self.msg = result.unwrap_or_else(|e| e);
         self.last_pull = Some(Instant::now());
         self.reload();
     }
 
-    /// Leaving the account picker: like Ctrl-S (fetch, then commit and push what is
-    /// pending), but only when there is something to push. A fixed-account screen
+    /// Leaving the account picker: fetch and commit eligible ledgers; only push
+    /// when mdl.autopush is enabled. A fixed-account screen
     /// leaves without syncing. None: nothing was done.
     fn quit_sync(&mut self) -> Option<Result<String, String>> {
         self.exiting = true;
@@ -1721,16 +1725,16 @@ impl Tui {
             Err(e) => return Some(Err(e)),
         };
         let pushed = if git::has_upstream(dir) { git::unpushed(dir) == 0 } else { !git::has_remote(dir) };
-        if pending.is_empty() && pushed {
+        if pending.is_empty() && (pushed || !git::autopush(dir)) {
             return None;
         }
-        Some(self.sync_job())
+        Some(self.sync_job(git::autopush(dir)))
     }
 
-    fn sync_job(&self) -> Result<String, String> {
+    fn sync_job(&self, push: bool) -> Result<String, String> {
         let dir = self.dir;
         let result = self.animate("Syncing…", move || {
-            git::pull(dir).and_then(|(_, n)| push_pending(dir, "").map(|(_, p)| format!("{n}; {p}")))
+            git::pull(dir).and_then(|(_, n)| crate::ledger::sync_pending(dir, "", push).map(|(_, p)| format!("{n}; {p}")))
         });
         self.record_git(&result, true);
         result
@@ -3211,7 +3215,7 @@ mod tests {
         let _ = fs::remove_dir_all(&dir);
     }
 
-    /// Leaving the screen pushes what is pending, after a fetch; a clean, pushed tree
+    /// Leaving the screen commits eligible changes and respects autopush; a clean tree
     /// leaves without touching git.
     #[test]
     fn tui_quit_syncs() {
@@ -3243,21 +3247,32 @@ mod tests {
         assert!(fixed.pull_job.is_none());
         assert!(git::fetched_ago(&a).is_none());
         assert!(fixed.quit_sync().is_none());
-        assert!(!git::pending(&a).unwrap().is_empty());
+        assert!(git::pending(&a).unwrap().is_empty());
         assert_eq!(git::unpushed(&a), 0);
 
         let mut t = Tui::new();
         t.dir = Box::leak(a.clone().into_boxed_path());
         t.in_repo = true;
-        // a fresh clone with a new account: committed and pushed on the way out
-        assert_eq!(t.quit_sync().unwrap().unwrap(), "no upstream branch yet; committed: mdl: update caja; pushed");
+        // New accounts need explicit enrollment. Auto-push is off by default.
+        assert!(t.quit_sync().is_none());
+        sh(&a, &["add", "caja.md"]);
+        sh(&a, &["commit", "--quiet", "-m", "Enroll caja"]);
+        assert_eq!(git::push(&a), "pushed");
+        fs::write(a.join("caja.md"), cash_head(4)).unwrap();
+        assert!(t.quit_sync().unwrap().unwrap().contains("automatic push disabled"));
+        assert_eq!(git::unpushed(&a), 1);
+        assert!(t.quit_sync().is_none());
+        sh(&a, &["config", "mdl.autopush", "true"]);
+        assert!(t.quit_sync().unwrap().unwrap().ends_with("pushed"));
         // clean and pushed: nothing to do, no note
         assert!(t.quit_sync().is_none());
         // the remote moved on and a local edit is pending: fetched, committed, pushed
         clone(&b);
         fs::write(b.join("banco.md"), cash_head(2)).unwrap();
-        assert_eq!(push_pending(&b, "from b").unwrap().1, "committed: from b; pushed");
-        fs::write(a.join("caja.md"), cash_head(4)).unwrap();
+        sh(&b, &["add", "banco.md"]);
+        sh(&b, &["commit", "--quiet", "-m", "Enroll banco"]);
+        assert_eq!(push_pending(&b, "from b").unwrap().1, "pushed");
+        fs::write(a.join("caja.md"), cash_head(5)).unwrap();
         assert_eq!(t.quit_sync().unwrap().unwrap(), "fast-forwarded to the upstream; committed: mdl: update caja; pushed");
         assert!(a.join("banco.md").exists());
         assert_eq!(git::unpushed(&a), 0);

@@ -1,9 +1,4 @@
-//! git for the account tree: fetch, fast-forward, merge, commit, push. Ported from
-//! matter's gitsync (itself from pgpv), minus anyhow. Accounts are plain text, so git
-//! merges them itself: a conflict is an ordinary text conflict fixed by hand, and the
-//! stale running balances a merge leaves behind are what `recalc` is for. Everything
-//! is scoped to `dir` (`-- .`) so an account tree inside a larger repository leaves
-//! the rest of it alone.
+//! Selective Git management for previously committed ledger documents.
 use std::path::Path;
 use std::process::{Command, Output};
 
@@ -19,12 +14,12 @@ pub enum State {
     FastForwarded,
     /// Local commits not yet on the remote.
     LocalAhead,
-    /// Local and remote histories diverged; the caller merges.
+    /// Local and remote histories diverged; manual reconciliation is required.
     Diverged,
 }
 
 fn git(dir: &Path, args: &[&str]) -> Result<Output, String> {
-    Command::new("git").arg("-C").arg(dir).args(args).output().map_err(|e| format!("cannot run git: {e}"))
+    Command::new("git").arg("-C").arg(dir).arg("--literal-pathspecs").args(args).output().map_err(|e| format!("cannot run git: {e}"))
 }
 
 /// Run git, failing with its stderr; returns trimmed stdout.
@@ -64,9 +59,23 @@ pub fn account_in_tree(dir: &Path, file: &str) -> bool {
 }
 
 /// `git config mdl.autocommit true` in the account repository: every save commits
-/// the file and pushes best-effort.
+/// eligible files locally. Automatic pushing is separately opt-in.
 pub fn autocommit(dir: &Path) -> bool {
     git_ok(dir, &["config", "--get", "--type=bool", "mdl.autocommit"]).is_ok_and(|v| v == "true")
+}
+
+pub fn autopush(dir: &Path) -> bool {
+    git_ok(dir, &["config", "--get", "--type=bool", "mdl.autopush"]).is_ok_and(|v| v == "true")
+}
+
+fn ensure_idle(dir: &Path) -> Result<(), String> {
+    for state in ["MERGE_HEAD", "CHERRY_PICK_HEAD", "REVERT_HEAD", "rebase-merge", "rebase-apply", "sequencer"] {
+        let path = git_ok(dir, &["rev-parse", "--git-path", state])?;
+        if dir.join(path).exists() {
+            return Err("Git operation in progress; finish it manually before syncing".into());
+        }
+    }
+    Ok(())
 }
 
 /// Fetch and classify local vs upstream. Fast-forwards when safe.
@@ -74,6 +83,7 @@ pub fn sync(dir: &Path) -> Result<State, String> {
     if !is_repo(dir) {
         return Ok(State::NoGit);
     }
+    ensure_idle(dir)?;
     let fetched = git(dir, &["fetch", "--quiet"]).map(|o| o.status.success()).unwrap_or(false);
     let (local, remote) = match (rev(dir, "HEAD"), rev(dir, "@{u}")) {
         (Some(l), Some(r)) => (l, r),
@@ -96,7 +106,7 @@ pub fn sync(dir: &Path) -> Result<State, String> {
     Ok(State::Diverged)
 }
 
-/// The read half: fetch, fast-forward, and merge when the histories diverged. Never
+/// The read half: fetch and fast-forward only. Never
 /// pushes. Returns whether files changed, and a one-line note.
 pub fn pull(dir: &Path) -> Result<(bool, &'static str), String> {
     Ok(match sync(dir)? {
@@ -106,10 +116,7 @@ pub fn pull(dir: &Path) -> Result<(bool, &'static str), String> {
         State::UpToDate => (false, "up to date"),
         State::FastForwarded => (true, "fast-forwarded to the upstream"),
         State::LocalAhead => (false, "local commits not yet pushed"),
-        State::Diverged => {
-            merge(dir)?;
-            (true, "merged the upstream")
-        }
+        State::Diverged => return Err("local and upstream histories diverged; merge or rebase manually".into()),
     })
 }
 
@@ -133,74 +140,66 @@ pub fn unpushed(dir: &Path) -> u32 {
     git_ok(dir, &["rev-list", "--count", "@{u}..HEAD"]).ok().and_then(|n| n.parse().ok()).unwrap_or(0)
 }
 
-/// Everything a commit would pick up: modified, deleted and untracked paths under
-/// `dir`, relative to it.
+/// Eligible modified files only. New files (including staged additions), deletes,
+/// renames, conflicts, and files with both staged and unstaged edits stay untouched.
 pub fn pending(dir: &Path) -> Result<Vec<String>, String> {
     let prefix = git_ok(dir, &["rev-parse", "--show-prefix"])?;
-    let out = git(dir, &["status", "--porcelain", "-z", "--untracked-files=all", "--", "."])?;
+    let out = git(dir, &["status", "--porcelain=v1", "-z", "--untracked-files=no", "--renames", "--", "."])?;
     if !out.status.success() {
         return Err(format!("git status failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
     }
     let mut fields = out.stdout.split(|b| *b == 0).filter(|f| !f.is_empty());
     let mut paths = Vec::new();
     while let Some(field) = fields.next() {
-        // "XY path", and for a rename or a copy the source path follows in a field of
-        // its own, which is not a change in itself. Paths are repository-relative.
-        let entry = String::from_utf8_lossy(field).into_owned();
-        if entry.len() < 4 {
-            continue;
-        }
-        let (code, path) = entry.split_at(3);
-        if code.starts_with('R') || code.starts_with('C') {
-            fields.next();
-        }
-        paths.push(path.strip_prefix(&prefix).unwrap_or(path).to_string());
+        if field.len() < 4 { continue; }
+        let code = &field[..2];
+        if code.contains(&b'R') || code.contains(&b'C') { fields.next(); }
+        if code != b" M" && code != b"M " { continue; }
+        let Ok(path) = std::str::from_utf8(&field[3..]) else { continue };
+        let Some(relative) = path.strip_prefix(&prefix) else { continue };
+        let file = dir.join(relative);
+        if !std::fs::symlink_metadata(&file).is_ok_and(|m| m.is_file()) { continue; }
+        if !account_in_tree(dir, &file.to_string_lossy()) { continue; }
+        let tracked = git(dir, &["ls-tree", "-z", "HEAD", "--", relative])?;
+        if !tracked.status.success() || !tracked.stdout.starts_with(b"100") { continue; }
+        if !crate::ledger::contains_ledger(&file.to_string_lossy()) { continue; }
+        paths.push(relative.to_string());
     }
     paths.sort();
     Ok(paths)
 }
 
-/// Stage everything under `dir` and commit it. `Ok(false)`: nothing had changed.
-pub fn commit_all(dir: &Path, msg: &str) -> Result<bool, String> {
-    git_ok(dir, &["add", "-A", "--", "."])?;
-    if git(dir, &["diff", "--cached", "--quiet", "--", "."])?.status.success() {
-        return Ok(false);
-    }
-    git_ok(dir, &["commit", "--quiet", "-m", msg])?;
+/// Commit exactly these eligible files. --only leaves unrelated staged changes
+/// in the index, and avoids staging anything if the commit fails.
+fn commit_paths(dir: &Path, paths: &[String], msg: &str) -> Result<bool, String> {
+    ensure_idle(dir)?;
+    let eligible = pending(dir)?;
+    let paths: Vec<&str> = paths.iter().filter(|p| eligible.contains(p)).map(String::as_str).collect();
+    if paths.is_empty() { return Ok(false); }
+    let mut args = vec!["commit", "--only", "--quiet", "-m", msg, "--"];
+    args.extend(paths);
+    git_ok(dir, &args)?;
     Ok(true)
 }
 
-/// Merge the upstream. Conflicts are an error listing the files; the user resolves
-/// them by hand (`mdl <file> lint` catches leftovers).
-pub fn merge(dir: &Path) -> Result<(), String> {
-    let out = git(dir, &["merge", "--no-edit", "@{u}"])?;
-    if out.status.success() {
-        return Ok(());
-    }
-    let conflicts = git(dir, &["diff", "--name-only", "--diff-filter=U"])
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
-        .unwrap_or_default();
-    if conflicts.is_empty() {
-        return Err(format!("git merge failed: {}", String::from_utf8_lossy(&out.stderr).trim()));
-    }
-    Err(format!(
-        "merge conflicts; edit these, then `git add` + `git commit` (and `mdl <file> lint`): {}",
-        conflicts.lines().collect::<Vec<_>>().join(", ")
-    ))
+pub fn commit_all(dir: &Path, msg: &str) -> Result<bool, String> {
+    commit_paths(dir, &pending(dir)?, msg)
 }
 
-/// Stage one file, commit if it changed, and push. Push failures are reported in the
-/// note, not as an error: the commit is safe locally and pushes next time.
+/// Save-time commit of one eligible account; pushing requires mdl.autopush.
 pub fn commit_push(dir: &Path, file: &str, msg: &str) -> Result<String, String> {
-    git_ok(dir, &["add", "--", file])?;
-    if git(dir, &["diff", "--cached", "--quiet"])?.status.success() {
-        return Ok("nothing to commit".into());
+    let target = Path::new(file).canonicalize().map_err(|e| e.to_string())?;
+    let paths: Vec<String> = pending(dir)?.into_iter().filter(|p|
+        dir.join(p).canonicalize().is_ok_and(|p| p == target)).collect();
+    if !commit_paths(dir, &paths, msg)? {
+        return Ok("saved locally; no eligible Git changes".into());
     }
-    git_ok(dir, &["commit", "--quiet", "-m", msg])?;
-    Ok(push(dir))
+    if autopush(dir) { Ok(push(dir)) }
+    else { Ok("committed locally; automatic push disabled".into()) }
 }
 
 pub fn push(dir: &Path) -> String {
+    if let Err(e) = ensure_idle(dir) { return format!("push failed ({e})"); }
     let args: &[&str] = if rev(dir, "@{u}").is_some() {
         &["push", "--quiet"]
     } else if has_remote(dir) {
