@@ -330,6 +330,27 @@ mouse wheel scroll the history; Esc or Ctrl-H returns to your unchanged entry fo
 History is read-only and includes new entries and inserted rows, including notes.
 It disappears when the session ends.
 
+To copy a description or amount, select its row and press **v**, or press
+**Ctrl-B** in an entry field. Copy mode marks the full value; **Left/Right**
+chooses the field, **Ctrl-Y** copies it through **OSC 52**, and **Esc** returns
+without changing the entry. Marking alone never writes to the clipboard. OSC 52
+copies the full value, even if its preview does not fit on screen, and sends it
+to the local terminal over SSH. The terminal (and any multiplexer in between)
+must allow OSC 52 clipboard writes.
+
+For regular **Cmd-C**, copy mode releases the mouse so you can select the displayed
+text with the terminal and use its normal Copy command. To copy the app's marked
+value directly via OSC 52, bind Cmd-C in your terminal profile to send **Ctrl-Y**
+(hex `19`, or `\x19`). For example, Ghostty configuration can use
+`keybind = super+c=text:\x19` (see its
+[keybinding actions](https://ghostty.org/docs/config/keybind/reference)). This
+replaces the terminal's native Copy binding wherever that configuration applies. MDL cannot intercept
+Cmd-C when the terminal consumes it locally.
+
+Paste normally with **Cmd-V** into a description or amount field. With bracketed
+paste, pasted newlines become spaces and cannot submit entries or execute row
+commands. An amount selected for replacement is replaced by the pasted value.
+
 The footer keeps keyboard hints separate from git status. A spinner marks a fetch,
 save, or sync; green checkmarks show successful updates, amber marks pending pushes
 or offline work, and red marks sync errors. Ctrl-S syncs with the remote. During a

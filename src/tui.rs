@@ -25,7 +25,7 @@ impl Raw {
     fn enter() -> Option<Raw> {
         let saved = stty(&["-g"])?;
         stty(&["raw", "-echo", "min", "0", "time", "1"])?;
-        print!("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        print!("\x1b[?2004h\x1b[?1000h\x1b[?1002h\x1b[?1006h");
         io::stdout().flush().ok();
         Some(Raw(saved))
     }
@@ -33,7 +33,7 @@ impl Raw {
 
 impl Drop for Raw {
     fn drop(&mut self) {
-        print!("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[2J\x1b[H");
+        print!("\x1b[?2004l\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[2J\x1b[H");
         io::stdout().flush().ok();
         stty(&[&self.0]);
     }
@@ -51,6 +51,9 @@ fn term_size() -> (usize, usize) {
 #[derive(Debug, PartialEq)]
 enum Key {
     Char(char),
+    Mark,
+    Copy,
+    Paste(String),
     TabLeft,
     TabRight,
     Enter,
@@ -118,7 +121,24 @@ fn read_byte(stdin: &mut impl Read) -> Option<u8> {
     (stdin.read(&mut b).ok()? == 1).then_some(b[0])
 }
 
+#[cfg(test)]
 fn read_key(stdin: &mut impl Read) -> Key {
+    read_input(stdin, &mut None)
+}
+
+fn read_input(stdin: &mut impl Read, paste: &mut Option<Vec<u8>>) -> Key {
+    if let Some(text) = paste {
+        while let Some(c) = read_byte(stdin) {
+            text.push(c);
+            if text.ends_with(b"\x1b[201~") {
+                text.truncate(text.len() - 6);
+                let result = Key::Paste(String::from_utf8_lossy(text).into_owned());
+                *paste = None;
+                return result;
+            }
+        }
+        return Key::Idle;
+    }
     loop {
         let Some(b) = read_byte(stdin) else { return Key::Idle };
         return match b {
@@ -131,6 +151,8 @@ fn read_key(stdin: &mut impl Read) -> Key {
             0x03 => Key::Esc,
             0x04 => Key::Delete,
             0x13 => Key::Sync,
+            0x02 => Key::Mark,
+            0x19 => Key::Copy,
             0x0c => Key::Clear,
             0x01 => Key::Home,
             0x05 => Key::End,
@@ -144,6 +166,11 @@ fn read_key(stdin: &mut impl Read) -> Key {
                 }
                 match seq.as_slice() {
                     b"" => Key::Esc,
+                    b"[200~" => {
+                        *paste = Some(Vec::new());
+                        return read_input(stdin, paste);
+                    }
+                    b"[99;9u" | b"[99;33u" | b"[99;6u" => Key::Copy,
                     b"[A" | b"OA" => Key::Prev,
                     b"[B" | b"OB" => Key::Next,
                     b"[Z" => Key::Prev,
@@ -179,6 +206,22 @@ fn read_key(stdin: &mut impl Read) -> Key {
             _ => continue,
         };
     }
+}
+
+/// OSC 52 targets the clipboard of the terminal receiving stdout, including over SSH.
+fn clipboard_sequence(text: &str) -> String {
+    const ALPHABET: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
+    let mut encoded = String::new();
+    for chunk in text.as_bytes().chunks(3) {
+        let a = chunk[0] as usize;
+        let b = chunk.get(1).copied().unwrap_or(0) as usize;
+        let c = chunk.get(2).copied().unwrap_or(0) as usize;
+        encoded.push(ALPHABET[a >> 2] as char);
+        encoded.push(ALPHABET[((a & 3) << 4) | (b >> 4)] as char);
+        encoded.push(if chunk.len() > 1 { ALPHABET[((b & 15) << 2) | (c >> 6)] as char } else { '=' });
+        encoded.push(if chunk.len() > 2 { ALPHABET[c & 63] as char } else { '=' });
+    }
+    format!("\x1b]52;c;{encoded}\x07")
 }
 
 /// All `*.md` files under `dir`, as relative paths, skipping hidden entries, `target`
@@ -527,6 +570,9 @@ struct Tui {
     /// Number of newest posts skipped in the history view; None closes it.
     history_scroll: Option<usize>,
     help: bool,
+    /// Copy mode column; clipboard writes happen only on an explicit copy key.
+    marked: Option<usize>,
+    clipboard: Option<String>,
     /// The search prompt, while open.
     search: Option<String>,
     /// The selection when the search began: where retyping the query searches from.
@@ -587,6 +633,8 @@ impl Tui {
             posts: vec![],
             history_scroll: None,
             help: false,
+            marked: None,
+            clipboard: None,
             search: None,
             search_start: None,
             offer_recalc: false,
@@ -722,8 +770,38 @@ impl Tui {
         }
     }
 
+    fn copy_text(&self, column: usize) -> String {
+        if let Some(row) = self.sel.filter(|_| !self.edit_form()).and_then(|i| self.rows().get(i)) {
+            match column {
+                0 => row.date.clone(),
+                1 => row.desc.clone(),
+                2 => fmt_col(row.debit),
+                3 => fmt_col(row.credit),
+                _ => fmt_amount(row.balance),
+            }
+        } else {
+            self.fields[column].clone()
+        }
+    }
+
     fn draw(&self) -> String {
-        let mut out = self.draw_screen();
+        if let Some(column) = self.marked {
+            let label = ["Date / account", "Description", "Debit", "Credit", "Balance"][column];
+            let text = self.copy_text(column);
+            let mut out = format!("\x1b[?1006l\x1b[?1002l\x1b[?1000l\x1b[?25l\x1b[H\x1b[J{label} marked\r\n");
+            out += &format!("{}\r\n\r\n", clipped("Left/Right field · Ctrl-Y copy · Esc back", self.cols));
+            // Native mouse selection remains available for the terminal's Cmd-C.
+            out += "\x1b[7m";
+            for (i, c) in text.chars().filter(|c| !c.is_control()).enumerate() {
+                if i >= self.cols * self.h.saturating_sub(5) { break; }
+                if i > 0 && i % self.cols == 0 { out += "\r\n"; }
+                out.push(c);
+            }
+            out += "\x1b[0m";
+            return out;
+        }
+        let mut out = String::from("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
+        out += &self.draw_screen();
         if self.help {
             let mut lines = vec!["Keyboard help"];
             if !self.tabs.is_empty() {
@@ -735,6 +813,8 @@ impl Tui {
                 "Tab / Shift-Tab: move between fields",
                 "On a row: t transfer, r reverse, n insert",
                 "Space: flag row; Delete: delete selected row",
+                "v on row / Ctrl-B in field: mark for copy",
+                "Ctrl-Y: copy marked value via OSC 52",
                 "/: search; Ctrl-H: session history",
                 "Ctrl-L: clear entry; Ctrl-S: sync"]);
             let width = self.cols.saturating_sub(4).min(70);
@@ -939,7 +1019,7 @@ impl Tui {
         let hint = if self.history_scroll.is_some() { "↑/↓ scroll · PgUp/PgDn · Ctrl-H/Esc back" }
             else if self.counterpart.as_ref().is_some_and(|d| d.choosing) { "Enter choose account · Tab matches · Esc cancel" }
             else if self.edit_form() { "Enter save · Tab next · Ctrl-H posts · Esc cancel" }
-            else if self.sel.is_some() { "Enter edit · t transfer · r reverse · n insert · / search · Ctrl-H posts · Esc back" }
+            else if self.sel.is_some() { "Enter edit · v copy · t transfer · r reverse · n insert · / search · Ctrl-H posts · Esc back" }
             else { "Enter next / save · Tab next · Ctrl-H posts · Ctrl-S sync" };
         let hint: String = hint.chars().take(room).collect();
         out += &format!("\x1b[2m{hint:<room$}\x1b[0m");
@@ -1905,6 +1985,16 @@ impl Tui {
         if key == Key::Idle {
             return true;
         }
+        if let Some(column) = self.marked {
+            match key {
+                Key::Esc | Key::Mark => self.marked = None,
+                Key::Left | Key::Prev => self.marked = Some(column.saturating_sub(1)),
+                Key::Right | Key::Next => self.marked = Some((column + 1).min(4)),
+                Key::Copy => self.clipboard = Some(self.copy_text(column)),
+                _ => {}
+            }
+            return true;
+        }
         if self.help {
             if matches!(key, Key::Char('?') | Key::Esc | Key::Enter) { self.help = false; }
             return true;
@@ -1913,6 +2003,28 @@ impl Tui {
         if key == Key::Char('?') && self.drag.is_none() && self.search.is_none()
             && !self.edit_form() && (self.history_scroll.is_some() || self.sel.is_some() || self.fields[self.focus].is_empty()) {
             self.help = true;
+            return true;
+        }
+        if (key == Key::Mark || (key == Key::Char('v') && self.sel.is_some() && !self.edit_form()))
+            && self.history_scroll.is_none() && self.search.is_none() && !self.offer_recalc
+            && !self.counterpart.as_ref().is_some_and(|d| d.choosing) {
+            if self.drag.is_some() { self.cancel_drag(); }
+            self.marked = Some(if self.sel.is_some() && !self.edit_form() { 1 } else { self.focus });
+            return true;
+        }
+        if key == Key::Copy { return true; }
+        if let Key::Paste(text) = &key {
+            // Pasted text is data, never a sequence of navigation or save commands.
+            if (self.sel.is_none() || self.edit_form()) && self.history_scroll.is_none() && self.search.is_none() && !self.offer_recalc {
+                if self.select { self.fields[self.focus].clear(); self.cur = usize::MAX; }
+                self.select = false;
+                if self.focus == 0 { self.pick = (String::new(), 0); }
+                for c in text.chars() {
+                    let c = if c.is_whitespace() { ' ' } else { c };
+                    if c.is_control() { continue; }
+                    if self.focus >= 2 { self.type_amount(c); } else { self.insert_char(c); }
+                }
+            }
             return true;
         }
         if self.history_scroll.is_some() {
@@ -2121,7 +2233,7 @@ impl Tui {
                 (None, Some(i)) => self.start_edit(i),
                 _ => self.enter(),
             },
-            Key::Idle | Key::History | Key::TabLeft | Key::TabRight => {}
+            Key::Idle | Key::History | Key::TabLeft | Key::TabRight | Key::Mark | Key::Copy | Key::Paste(_) => {}
         }
         if self.fields[0] != account_before {
             self.pick = (String::new(), 0); // new text: the first match is highlighted
@@ -2142,6 +2254,7 @@ pub fn tui(file: Option<&str>) -> Result<(), String> {
     if file.is_none() {
         t.start_pull();
     }
+    let mut paste = None;
     let mut size_checked = Instant::now();
     print!("\x1b[2J\x1b[3J");
     if let Some(path) = file {
@@ -2152,7 +2265,7 @@ pub fn tui(file: Option<&str>) -> Result<(), String> {
         io::stdout().flush().ok();
         // wait for a key; while waiting, a finished background pull gets its note shown
         let key = loop {
-            match read_key(&mut stdin) {
+            match read_input(&mut stdin, &mut paste) {
                 Key::Idle if t.pull_done() => {
                     t.msg = t.finish_pull().unwrap_or_else(|e| e);
                     break None;
@@ -2175,6 +2288,10 @@ pub fn tui(file: Option<&str>) -> Result<(), String> {
             t.msg.clear();
             if !t.handle(k) {
                 break;
+            }
+            if let Some(text) = t.clipboard.take() {
+                print!("{}", clipboard_sequence(&text));
+                io::stdout().flush().ok();
             }
         }
     }
@@ -2220,6 +2337,81 @@ mod tests {
             }
         }
         out
+    }
+
+    #[test]
+    fn clipboard_encoding_and_copy_are_explicit() {
+        assert_eq!(clipboard_sequence("f"), "\x1b]52;c;Zg==\x07");
+        assert_eq!(clipboard_sequence("fo"), "\x1b]52;c;Zm8=\x07");
+        assert_eq!(clipboard_sequence("foo"), "\x1b]52;c;Zm9v\x07");
+        assert_eq!(clipboard_sequence("café"), "\x1b]52;c;Y2Fmw6k=\x07");
+        let mut t = Tui::new();
+        t.focus = 1;
+        t.fields[1] = "café | payment".into();
+        t.fields[2] = "123.45".into();
+        let fields = t.fields.clone();
+        t.handle(Key::Mark);
+        assert!(t.clipboard.is_none());
+        assert!(t.draw().contains("Description marked"));
+        assert!(t.draw().contains("\x1b[?1000l"));
+        t.handle(Key::Copy);
+        assert_eq!(t.clipboard.take().as_deref(), Some("café | payment"));
+        t.handle(Key::Right);
+        assert!(t.clipboard.is_none());
+        t.handle(Key::Copy);
+        assert_eq!(t.clipboard.take().as_deref(), Some("123.45"));
+        t.handle(Key::Delete);
+        assert_eq!(t.fields, fields);
+        t.handle(Key::Esc);
+        assert!(t.marked.is_none());
+        assert!(t.draw().contains("\x1b[?1000h"));
+    }
+
+    #[test]
+    fn marking_statement_cells_keeps_the_ledger_unchanged() {
+        let mut t = Tui::new();
+        t.account = Some(("cash.md".into(), load("cash.md").unwrap()));
+        t.sel = Some(1);
+        let row = t.rows()[1].clone();
+        t.handle(Key::Char('v'));
+        assert_eq!(t.marked, Some(1));
+        assert!(t.clipboard.is_none());
+        assert_eq!(t.copy_text(1), row.desc);
+        t.handle(Key::Right);
+        t.handle(Key::Copy);
+        assert_eq!(t.clipboard.take(), Some(fmt_col(row.debit)));
+        t.handle(Key::Delete);
+        assert_eq!(t.rows()[1].desc, row.desc);
+        t.handle(Key::Esc);
+        t.start_edit(1);
+        t.cur = 0;
+        t.handle(Key::Paste("pasted ".into()));
+        assert_eq!(t.fields[1], format!("pasted {}", row.desc));
+        t.handle(Key::Mark);
+        assert_eq!(t.copy_text(1), t.fields[1]);
+        assert_eq!(t.rows()[1].desc, row.desc);
+    }
+
+    #[test]
+    fn bracketed_paste_survives_timeouts_and_does_not_execute_commands() {
+        let mut paste = None;
+        assert_eq!(read_input(&mut &b"\x1b[200~caf"[..], &mut paste), Key::Idle);
+        let key = read_input(&mut &b"\xc3\xa9\n\x1b[201~"[..], &mut paste);
+        assert_eq!(key, Key::Paste("café\n".into()));
+        assert!(paste.is_none());
+        let mut t = Tui::new();
+        t.focus = 1;
+        t.handle(key);
+        assert_eq!(t.fields[1], "café ");
+        assert_eq!(t.focus, 1);
+        assert!(t.rows().is_empty());
+        t.focus = 2;
+        t.fields[2] = "10.00".into();
+        t.select = true;
+        t.handle(Key::Paste("123.45".into()));
+        assert_eq!(t.fields[2], "123.45");
+        assert_eq!(read_key(&mut &b"\x19"[..]), Key::Copy);
+        assert_eq!(read_key(&mut &b"\x1b[99;9u"[..]), Key::Copy);
     }
 
     #[test]
