@@ -803,31 +803,48 @@ impl Tui {
         let mut out = String::from("\x1b[?1000h\x1b[?1002h\x1b[?1006h");
         out += &self.draw_screen();
         if self.help {
-            let mut lines = vec!["Keyboard help"];
+            let mut lines = vec![("", "Keyboard help")];
             if !self.tabs.is_empty() {
-                lines.extend(["Ctrl-P / Ctrl-N: previous / next tab",
-                    "Ctrl-Left / Ctrl-Right or click: switch tabs",
-                    "Finish or cancel an entry before switching tabs"]);
+                lines.extend([("Ctrl-P / Ctrl-N", "Previous / next tab"),
+                    ("Ctrl-Left / Ctrl-Right", "Switch tabs (or click)"),
+                    ("", "Finish or cancel an entry before switching tabs")]);
             }
-            lines.extend(["Enter: next field / save / edit selected row",
-                "Tab / Shift-Tab: move between fields",
-                "On a row: t transfer, r reverse, n insert",
-                "Space: flag row; Delete: delete selected row",
-                "v on row / Ctrl-B in field: mark for copy",
-                "Ctrl-Y: copy marked value via OSC 52",
-                "/: search; Ctrl-H: session history",
-                "Ctrl-L: clear entry; Ctrl-S: sync"]);
+            lines.extend([("Enter", "Next field / save / edit selected row"),
+                ("Tab / Shift-Tab", "Move between fields"),
+                ("t", "Transfer selected row"),
+                ("r", "Reverse selected row"),
+                ("n", "Insert row"),
+                ("Space", "Flag selected row"),
+                ("Delete", "Delete selected row"),
+                ("v / Ctrl-B", "Mark row value / field for copy"),
+                ("Ctrl-Y", "Copy marked value via OSC 52"),
+                ("/", "Search"),
+                ("Ctrl-H", "Session history"),
+                ("Ctrl-L", "Clear entry"),
+                ("Ctrl-S", "Sync")]);
             let width = self.cols.saturating_sub(4).min(70);
             lines.truncate(self.h.saturating_sub(5));
-            lines.push("? / Esc / Enter: close help");
+            lines.push(("? / Esc / Enter", "Close help"));
             let height = lines.len() + 2;
             let top = self.h.saturating_sub(height) / 2 + 1;
             let left = self.cols.saturating_sub(width + 2) / 2 + 1;
             out += "\x1b[?25l\x1b[0m";
             out += &format!("\x1b[{top};{left}H┌{}┐", "─".repeat(width));
-            for (i, line) in lines.iter().enumerate() {
-                let text = clipped(line, width);
-                out += &format!("\x1b[{};{left}H│{text:<width$}│", top + i + 1);
+            let inner = width.saturating_sub(2);
+            // Keep descriptions aligned, leaving room for them on narrow terminals.
+            let key_width = lines.iter().map(|(key, _)| key.len()).max().unwrap_or(0).min(inner / 2);
+            for (i, (key, description)) in lines.iter().enumerate() {
+                let text = if key.is_empty() {
+                    let text = clipped(description, inner);
+                    let style = if i == 0 { "\x1b[1m" } else { "\x1b[2m" };
+                    format!("{style}{text:<inner$}\x1b[0m")
+                } else {
+                    let key = clipped(key, key_width);
+                    let description_width = inner.saturating_sub(key_width + 2);
+                    let description = clipped(description, description_width);
+                    format!("\x1b[1m{key:<key_width$}\x1b[0m  {description:<description_width$}")
+                };
+                out += &format!("\x1b[{};{left}H│ {text} │", top + i + 1);
             }
             out += &format!("\x1b[{};{left}H└{}┘", top + height - 1, "─".repeat(width));
         }
